@@ -195,8 +195,13 @@ class OptPrecipitatorData(UnitModelBlockData):
 
         # ------------------------------------------------------------------ #
         # Merged reaction sets and ln(K) parameter
+        # Gas reactions are merged here so rxn_extent is built with the full
+        # index set — avoids stale variable references if gas constraints are
+        # added later in _build_gas_phase().
         # ------------------------------------------------------------------ #
         self.merged_ln_k_dict = prop_aq.ln_k_aq_dict | prop_sp.ln_k_sp_dict
+        if self.config.property_package_gas is not None:
+            self.merged_ln_k_dict |= self.config.property_package_gas.ln_k_gas_dict
         self.merged_rxns = list(self.merged_ln_k_dict.keys())
 
         self.log_k = pyo.Param(
@@ -370,29 +375,7 @@ class OptPrecipitatorData(UnitModelBlockData):
         self.add_inlet_port(block=self.cv_gas, name="gas_inlet")
         self.add_outlet_port(block=self.cv_gas, name="gas_outlet")
 
-        # Add gas-reaction K values to the merged dict and log_k param
-        for r, lnk in prop_gas.ln_k_gas_dict.items():
-            self.merged_ln_k_dict[r] = lnk
-            self.merged_rxns.append(r)
-
-        # Reconstruct log_k to include gas reactions
-        self.del_component(self.log_k)
-        self.log_k = pyo.Param(
-            self.merged_rxns,
-            initialize=lambda m, r: self.merged_ln_k_dict[r],
-            within=pyo.Reals,
-            doc="ln(K) for each reaction including gas reactions",
-        )
-
-        # Extend rxn_extent to cover gas reactions
-        self.del_component(self.rxn_extent)
-        self.rxn_extent = pyo.Var(
-            self.merged_rxns,
-            initialize=0,
-            bounds=(-1e5, 1e5),
-            units=pyunits.mol / pyunits.L,
-            doc="Extent of reaction r (mol/L)",
-        )
+        # log_k and rxn_extent already include gas reactions — merged in build()
 
         # Internal log-space variables for gas phase
         self.log_partial_pressure = pyo.Var(
