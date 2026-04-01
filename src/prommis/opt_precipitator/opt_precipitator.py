@@ -116,9 +116,9 @@ class OptPrecipitatorData(UnitModelBlockData):
     CONFIG.declare(
         "property_package_precipitate",
         ConfigValue(
-            default=useDefault,
+            default=None,
             domain=is_physical_parameter_block,
-            description="Property package for the precipitate (solid) phase",
+            description="Property package for the precipitate (solid) phase (optional; omit for no solids)",
         ),
     )
     CONFIG.declare(
@@ -176,22 +176,25 @@ class OptPrecipitatorData(UnitModelBlockData):
             property_package=prop_aq,
             property_package_args=self.config.property_package_args_aqueous,
         )
-        self.cv_precipitate = ControlVolume0DBlock(
-            dynamic=False,
-            has_holdup=False,
-            property_package=prop_sp,
-            property_package_args=self.config.property_package_args_precipitate,
-        )
         self.cv_aqueous.add_state_blocks(has_phase_equilibrium=False)
-        self.cv_precipitate.add_state_blocks(has_phase_equilibrium=False)
+
+        if prop_sp is not None:
+            self.cv_precipitate = ControlVolume0DBlock(
+                dynamic=False,
+                has_holdup=False,
+                property_package=prop_sp,
+                property_package_args=self.config.property_package_args_precipitate,
+            )
+            self.cv_precipitate.add_state_blocks(has_phase_equilibrium=False)
 
         # ------------------------------------------------------------------ #
         # Ports
         # ------------------------------------------------------------------ #
         self.add_inlet_port(block=self.cv_aqueous, name="aqueous_inlet")
         self.add_outlet_port(block=self.cv_aqueous, name="aqueous_outlet")
-        self.add_inlet_port(block=self.cv_precipitate, name="precipitate_inlet")
-        self.add_outlet_port(block=self.cv_precipitate, name="precipitate_outlet")
+        if prop_sp is not None:
+            self.add_inlet_port(block=self.cv_precipitate, name="precipitate_inlet")
+            self.add_outlet_port(block=self.cv_precipitate, name="precipitate_outlet")
 
         # ------------------------------------------------------------------ #
         # Merged reaction sets and ln(K) parameter
@@ -199,7 +202,9 @@ class OptPrecipitatorData(UnitModelBlockData):
         # index set — avoids stale variable references if gas constraints are
         # added later in _build_gas_phase().
         # ------------------------------------------------------------------ #
-        self.merged_ln_k_dict = prop_aq.ln_k_aq_dict | prop_sp.ln_k_sp_dict
+        self.merged_ln_k_dict = dict(prop_aq.ln_k_aq_dict)
+        if prop_sp is not None:
+            self.merged_ln_k_dict |= prop_sp.ln_k_sp_dict
         if self.config.property_package_gas is not None:
             self.merged_ln_k_dict |= self.config.property_package_gas.ln_k_gas_dict
         self.merged_rxns = list(self.merged_ln_k_dict.keys())
@@ -239,13 +244,14 @@ class OptPrecipitatorData(UnitModelBlockData):
         )
 
         # log(Q) for precipitation reactions (ion activity product in log space)
-        self.log_q_sp = pyo.Var(
-            prop_sp.rxn_set,
-            initialize=-5,
-            bounds=(-100, 10),
-            units=pyunits.dimensionless,
-            doc="ln(Q_r) for precipitation reaction r (sum of alpha * log_conc_out)",
-        )
+        if prop_sp is not None:
+            self.log_q_sp = pyo.Var(
+                prop_sp.rxn_set,
+                initialize=-5,
+                bounds=(-100, 10),
+                units=pyunits.dimensionless,
+                doc="ln(Q_r) for precipitation reaction r (sum of alpha * log_conc_out)",
+            )
 
         # ------------------------------------------------------------------ #
         # Constraints
@@ -275,29 +281,29 @@ class OptPrecipitatorData(UnitModelBlockData):
                 for i in prop_aq.stoich_aq_dict[r]
             )
 
-        # Precipitation: define log(Q) for each precipitation reaction
-        # (sum over aqueous species only; solids have unit activity)
-        @self.Constraint(
-            self.flowsheet().time,
-            prop_sp.rxn_set,
-            doc="log(Q) definition for precipitation reactions (aqueous species only)",
-        )
-        def log_q_precipitate_equilibrium_rxn_eqns(blk, t, r):
-            return blk.log_q_sp[r] == sum(
-                prop_aq.stoich_aq_dict[r][i] * blk.log_conc_out[i]
-                for i in prop_aq.stoich_aq_dict.get(r, {})
+        if prop_sp is not None:
+            # Precipitation: define log(Q) for each precipitation reaction
+            # (sum over aqueous species only; solids have unit activity)
+            @self.Constraint(
+                self.flowsheet().time,
+                prop_sp.rxn_set,
+                doc="log(Q) definition for precipitation reactions (aqueous species only)",
             )
+            def log_q_precipitate_equilibrium_rxn_eqns(blk, t, r):
+                return blk.log_q_sp[r] == sum(
+                    prop_aq.stoich_aq_dict[r][i] * blk.log_conc_out[i]
+                    for i in prop_aq.stoich_aq_dict.get(r, {})
+                )
 
-        # Precipitation saturation inequality: log(Q) <= ln(K_sp)
-        @self.Constraint(
-            prop_sp.rxn_set,
-            doc="Precipitation saturation: ion activity product <= solubility product",
-        )
-        def precip_sat_ineq(blk, r):
-            return blk.log_q_sp[r] <= blk.log_k[r]
+            # Precipitation saturation inequality: log(Q) <= ln(K_sp)
+            @self.Constraint(
+                prop_sp.rxn_set,
+                doc="Precipitation saturation: ion activity product <= solubility product",
+            )
+            def precip_sat_ineq(blk, r):
+                return blk.log_q_sp[r] <= blk.log_k[r]
 
         # Aqueous mole balance: conc_out = conc_in + sum(alpha * rxn_extent)
-        # CMI convention: no flow_vol factor; rxn_extent is in mol/L
         @self.Constraint(
             self.flowsheet().time,
             prop_aq.component_list,
@@ -323,36 +329,36 @@ class OptPrecipitatorData(UnitModelBlockData):
                 == blk.cv_aqueous.properties_in[t].flow_vol
             )
 
-        # Precipitate mole balance: moles_out = moles_in + sum(alpha * rxn_extent * flow_vol)
-        @self.Constraint(
-            self.flowsheet().time,
-            prop_sp.component_list,
-            doc="Precipitate species mole balance",
-        )
-        def precipitate_mole_balance_eqns(blk, t, i):
-            return blk.cv_precipitate.properties_out[t].moles_precipitate_comp[i] == (
-                blk.cv_precipitate.properties_in[t].moles_precipitate_comp[i]
-                + sum(
-                    prop_sp.stoich_sp_dict.get(r, {}).get(i, 0)
-                    * blk.rxn_extent[r]
-                    * blk.cv_aqueous.properties_out[t].flow_vol
-                    for r in prop_sp.rxn_set
-                )
+        if prop_sp is not None:
+            # Precipitate mole balance: moles_out = moles_in + sum(alpha * rxn_extent * flow_vol)
+            @self.Constraint(
+                self.flowsheet().time,
+                prop_sp.component_list,
+                doc="Precipitate species mole balance",
             )
+            def precipitate_mole_balance_eqns(blk, t, i):
+                return blk.cv_precipitate.properties_out[t].moles_precipitate_comp[i] == (
+                    blk.cv_precipitate.properties_in[t].moles_precipitate_comp[i]
+                    + sum(
+                        prop_sp.stoich_sp_dict.get(r, {}).get(i, 0)
+                        * blk.rxn_extent[r]
+                        * blk.cv_aqueous.properties_out[t].flow_vol
+                        for r in prop_sp.rxn_set
+                    )
+                )
 
         # ------------------------------------------------------------------ #
         # Objective: minimise sum of squared saturation index residuals
         # min  sum_r ( ln(K_sp[r]) - ln(Q[r]) )^2  for r in N_rxn_sp
-        # When no precipitation reactions exist the sum is zero (feasibility).
+        # When prop_sp is None or has no reactions, returns 0 (feasibility problem).
         # ------------------------------------------------------------------ #
         @self.Objective(
             doc="Minimise sum of squared log(K) - log(Q) residuals for precipitation reactions",
         )
         def min_saturation_index(blk):
-            return sum(
-                (blk.log_k[r] - blk.log_q_sp[r]) ** 2
-                for r in prop_sp.rxn_set
-            )
+            if prop_sp is None or len(prop_sp.rxn_set) == 0:
+                return 0
+            return sum((blk.log_k[r] - blk.log_q_sp[r]) ** 2 for r in prop_sp.rxn_set)
 
         # ------------------------------------------------------------------ #
         # Gas phase extension (Phase 3) — built conditionally
@@ -419,9 +425,8 @@ class OptPrecipitatorData(UnitModelBlockData):
             doc="Link log_moles_gas_out to moles_gas_out",
         )
         def log_moles_gas_linking_eqns(blk, t, i):
-            return (
-                blk.cv_gas.properties_out[t].moles_gas_comp[i]
-                == pyo.exp(blk.log_moles_gas_out[i])
+            return blk.cv_gas.properties_out[t].moles_gas_comp[i] == pyo.exp(
+                blk.log_moles_gas_out[i]
             )
 
         # Gas-liquid Henry's Law equilibrium
@@ -447,7 +452,7 @@ class OptPrecipitatorData(UnitModelBlockData):
             )
             return blk.log_k[r] == gas_term + aq_term
 
-        # Ideal gas law: ln(P_i) - ln(ng_i/flow_vol) = ln(R*T)
+        # Ideal gas law: ln(P_i) - ln(ng_i) = ln(R*T/flow_vol)
         # i.e. P_i = (ng_i / flow_vol) * R * T   (treating ng/flow_vol as gas concentration)
         R_gas = 0.08314  # L·bar / mol / K
 
@@ -457,9 +462,8 @@ class OptPrecipitatorData(UnitModelBlockData):
             doc="Ideal gas law in log space (P = c_gas * R * T)",
         )
         def ideal_gas_eqns(blk, t, i):
-            return (
-                blk.log_partial_pressure[i] - blk.log_moles_gas_out[i]
-                == pyo.log(R_gas * self.config.temperature / flow_vol_in)
+            return blk.log_partial_pressure[i] - blk.log_moles_gas_out[i] == pyo.log(
+                R_gas * self.config.temperature / flow_vol_in
             )
 
         # Gas mole balance: moles_gas_out = moles_gas_in + sum(alpha * rxn_extent * flow_vol)
@@ -483,9 +487,10 @@ class OptPrecipitatorData(UnitModelBlockData):
         streams = {
             "Aqueous Inlet": self.aqueous_inlet,
             "Aqueous Outlet": self.aqueous_outlet,
-            "Precipitate Inlet": self.precipitate_inlet,
-            "Precipitate Outlet": self.precipitate_outlet,
         }
+        if self.config.property_package_precipitate is not None:
+            streams["Precipitate Inlet"] = self.precipitate_inlet
+            streams["Precipitate Outlet"] = self.precipitate_outlet
         if self.config.property_package_gas is not None:
             streams["Gas Inlet"] = self.gas_inlet
             streams["Gas Outlet"] = self.gas_outlet

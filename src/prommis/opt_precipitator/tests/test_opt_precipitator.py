@@ -255,6 +255,49 @@ class TestOptPrecipitatorBuild:
         assert hasattr(model.fs.precipitator, "min_saturation_index")
 
 
+@pytest.mark.build
+class TestOptPrecipitatorNoSolidBuild:
+    """Structural tests: OptPrecipitator with no precipitate package (aqueous-only)."""
+
+    @pytest.fixture
+    def model(self):
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+        m.fs.aq_props = AqueousParameter(
+            aqueous_comp_list=AQ_COMP_LIST,
+            ln_k_aq_dict=LN_K_AQ_DICT,
+            stoich_aq_dict=STOICH_AQ_DICT,
+        )
+        m.fs.precipitator = OptPrecipitator(
+            property_package_aqueous=m.fs.aq_props,
+            # property_package_precipitate omitted — defaults to None
+        )
+        return m
+
+    def test_no_precipitate_control_volume(self, model):
+        assert hasattr(model.fs.precipitator, "cv_aqueous")
+        assert not hasattr(model.fs.precipitator, "cv_precipitate")
+        assert not hasattr(model.fs.precipitator, "cv_gas")
+
+    def test_no_precipitate_ports(self, model):
+        prec = model.fs.precipitator
+        assert hasattr(prec, "aqueous_inlet")
+        assert hasattr(prec, "aqueous_outlet")
+        assert not hasattr(prec, "precipitate_inlet")
+        assert not hasattr(prec, "precipitate_outlet")
+        assert not hasattr(prec, "gas_inlet")
+
+    def test_no_log_q_sp(self, model):
+        assert not hasattr(model.fs.precipitator, "log_q_sp")
+
+    def test_rxn_extent_aqueous_only(self, model):
+        # Only aqueous reactions (1, 2) — no precipitation reactions
+        assert set(model.fs.precipitator.rxn_extent.keys()) == {1, 2}
+
+    def test_objective_exists(self, model):
+        assert hasattr(model.fs.precipitator, "min_saturation_index")
+
+
 # ===========================================================================
 # Phase 2: Precipitation Solver Tests
 # ===========================================================================
@@ -502,16 +545,9 @@ class TestAqueousOnlySolver:
             ln_k_aq_dict=LN_K_AQ_DICT,
             stoich_aq_dict=STOICH_AQ_DICT,
         )
-        # One-species precipitate with no reactions — forces the model into
-        # the "no precipitation reactions" code path without IDAES empty-list issues.
-        m.fs.sp_props = PrecipitateParameter(
-            precipitate_comp_list=["AgCl(s)"],
-            ln_k_sp_dict={},
-            stoich_sp_dict={},
-        )
+        # No precipitate package — aqueous-only code path
         m.fs.precipitator = OptPrecipitator(
             property_package_aqueous=m.fs.aq_props,
-            property_package_precipitate=m.fs.sp_props,
         )
         prec = m.fs.precipitator
 
@@ -521,7 +557,6 @@ class TestAqueousOnlySolver:
         prec.aqueous_inlet.conc_mol_comp[0, "AgCl(aq)"].fix(1e-20)
         prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1e-7)
         prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(1e-7)
-        prec.precipitate_inlet.moles_precipitate_comp[0, "AgCl(s)"].fix(1e-20)
 
         for comp, c0 in [
             ("Ag+", 1e-4),
@@ -533,9 +568,6 @@ class TestAqueousOnlySolver:
             prec.cv_aqueous.properties_out[0].conc_mol_comp[comp].set_value(c0)
             prec.log_conc_out[comp].set_value(math.log(c0))
         prec.cv_aqueous.properties_out[0].flow_vol.set_value(1.0)
-        prec.cv_precipitate.properties_out[0].moles_precipitate_comp["AgCl(s)"].set_value(
-            1e-20
-        )
 
         solver = SolverFactory("ipopt")
         solver.options = {
@@ -599,13 +631,7 @@ class TestGasLiquidSolver:
             ln_k_aq_dict=LN_K_AQ_DICT_CO2,
             stoich_aq_dict=STOICH_AQ_DICT_CO2,
         )
-        # No precipitation in the CO₂ system — one dummy solid to satisfy the
-        # IDAES requirement for a non-empty precipitate property package.
-        m.fs.sp_props = PrecipitateParameter(
-            precipitate_comp_list=["dummy_solid"],
-            ln_k_sp_dict={},
-            stoich_sp_dict={},
-        )
+        # No precipitation in the CO₂ system — no precipitate package needed
         m.fs.gas_props = GasParameter(
             gas_comp_list=GAS_COMP_LIST_CO2,
             ln_k_gas_dict=LN_K_GAS_DICT_CO2,
@@ -615,7 +641,6 @@ class TestGasLiquidSolver:
         )
         m.fs.precipitator = OptPrecipitator(
             property_package_aqueous=m.fs.aq_props,
-            property_package_precipitate=m.fs.sp_props,
             property_package_gas=m.fs.gas_props,
             temperature=298.15,
         )
@@ -628,7 +653,6 @@ class TestGasLiquidSolver:
         prec.aqueous_inlet.conc_mol_comp[0, "CO3(2-)"].fix(4.677e-11)
         prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1.436e-4)
         prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(7.009e-11)
-        prec.precipitate_inlet.moles_precipitate_comp[0, "dummy_solid"].fix(1e-20)
         prec.gas_inlet.moles_gas_comp[0, "CO2(g)"].fix(5.568e-2)
 
         # Initial guesses from equilibrium concentrations
@@ -643,9 +667,6 @@ class TestGasLiquidSolver:
             prec.cv_aqueous.properties_out[0].conc_mol_comp[comp].set_value(c0)
             prec.log_conc_out[comp].set_value(math.log(c0))
         prec.cv_aqueous.properties_out[0].flow_vol.set_value(1.0)
-        prec.cv_precipitate.properties_out[0].moles_precipitate_comp["dummy_solid"].set_value(
-            1e-20
-        )
         prec.cv_gas.properties_out[0].moles_gas_comp["CO2(g)"].set_value(5.568e-2)
         prec.log_moles_gas_out["CO2(g)"].set_value(math.log(5.568e-2))
         prec.log_partial_pressure["CO2(g)"].set_value(math.log(1.38))

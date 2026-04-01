@@ -48,7 +48,6 @@ from idaes.core import FlowsheetBlock
 
 from prommis.opt_precipitator.aqueous_properties import AqueousParameter
 from prommis.opt_precipitator.opt_precipitator import OptPrecipitator
-from prommis.opt_precipitator.precipitate_properties import PrecipitateParameter
 
 # ============================================================================
 # Thermodynamic data (pre-corrected to T = 320 K)
@@ -88,11 +87,6 @@ STOICH_AQ_DICT = {
     2: {"Ag+": -1, "Cl-": -1, "AgCl(aq)": 1},
 }
 
-# Precipitate package — required by OptPrecipitator; no solid reactions here
-SP_COMP_LIST = ["AgCl(s)"]  # dummy solid, never forms in this scenario
-LN_K_SP_DICT = {}  # no precipitation reactions
-STOICH_SP_DICT = {}
-
 # Initial aqueous concentrations (mol/L)
 C0 = {
     "H+": 1e-5,
@@ -120,15 +114,9 @@ def build_model():
         ln_k_aq_dict=LN_K_AQ_DICT,
         stoich_aq_dict=STOICH_AQ_DICT,
     )
-    m.fs.sp_props = PrecipitateParameter(
-        precipitate_comp_list=SP_COMP_LIST,
-        ln_k_sp_dict=LN_K_SP_DICT,
-        stoich_sp_dict=STOICH_SP_DICT,
-    )
 
     m.fs.prec = OptPrecipitator(
         property_package_aqueous=m.fs.aq_props,
-        property_package_precipitate=m.fs.sp_props,
         temperature=T,
     )
 
@@ -138,9 +126,6 @@ def build_model():
     prec.aqueous_inlet.flow_vol[0].fix(FLOW_VOL)
     for species, conc in C0.items():
         prec.aqueous_inlet.conc_mol_comp[0, species].fix(conc)
-
-    # Fix precipitate inlet (dummy solid at trace amounts)
-    prec.precipitate_inlet.moles_precipitate_comp[0, "AgCl(s)"].fix(1e-20)
 
     return m
 
