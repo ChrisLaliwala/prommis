@@ -145,10 +145,10 @@ def build_model():
     # Fix process temperature (T = T_ref here, so Van't Hoff correction is zero)
     prec.temperature.fix(T)
 
-    # Fix aqueous inlet
+    # Fix aqueous inlet (molar flows = concentration × volumetric flow rate)
     prec.aqueous_inlet.flow_vol[0].fix(FLOW_VOL)
-    for species, conc in C0.items():
-        prec.aqueous_inlet.conc_mol_comp[0, species].fix(conc)
+    for sp, conc in C0.items():
+        prec.aqueous_inlet.flow_mol_comp[0, sp].fix(conc * FLOW_VOL)
 
     # Fix gas inlet
     prec.gas_inlet.moles_gas_comp[0, "CO2(g)"].fix(NG0_CO2G)
@@ -157,11 +157,11 @@ def build_model():
     for sp in AQ_COMP_LIST:
         prec.log_conc_out[sp].set_value(math.log(max(C0[sp], 1e-20)))
 
-    # Initialise outlet aqueous state from inlet
+    # Initialise outlet aqueous state from inlet (molar flow = conc × flow_vol)
     t0 = m.fs.time.first()
     for sp in AQ_COMP_LIST:
-        prec.cv_aqueous.properties_out[t0].conc_mol_comp[sp].set_value(
-            max(C0[sp], 1e-20)
+        prec.cv_aqueous.properties_out[t0].flow_mol_comp[sp].set_value(
+            max(C0[sp], 1e-20) * FLOW_VOL
         )
 
     return m

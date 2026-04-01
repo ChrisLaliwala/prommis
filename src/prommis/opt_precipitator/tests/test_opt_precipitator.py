@@ -363,13 +363,14 @@ class TestPrecipitationSolver:
         prec = m.fs.precipitator
         prec.temperature.fix(298.15)
 
-        # Fix aqueous inlet (flow_vol in L/s, conc in mol/L)
-        prec.aqueous_inlet.flow_vol[0].fix(2.0)
-        prec.aqueous_inlet.conc_mol_comp[0, "Ag+"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "Cl-"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "AgCl(aq)"].fix(1e-20)
-        prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1e-7)
-        prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(1e-7)
+        # Fix aqueous inlet (molar flows = concentration × flow_vol)
+        flow_vol = 2.0
+        prec.aqueous_inlet.flow_vol[0].fix(flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Ag+"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Cl-"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "AgCl(aq)"].fix(1e-20 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "H+"].fix(1e-7 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "OH-"].fix(1e-7 * flow_vol)
 
         # Fix precipitate inlet
         prec.precipitate_inlet.moles_precipitate_comp[0, "AgCl(s)"].fix(1e-5)
@@ -382,9 +383,9 @@ class TestPrecipitationSolver:
             ("H+", 1e-7),
             ("OH-", 1e-7),
         ]:
-            prec.cv_aqueous.properties_out[0].conc_mol_comp[comp].set_value(c0)
+            prec.cv_aqueous.properties_out[0].flow_mol_comp[comp].set_value(c0 * flow_vol)
             prec.log_conc_out[comp].set_value(math.log(c0))
-        prec.cv_aqueous.properties_out[0].flow_vol.set_value(2.0)
+        prec.cv_aqueous.properties_out[0].flow_vol.set_value(flow_vol)
         prec.cv_precipitate.properties_out[0].moles_precipitate_comp["AgCl(s)"].set_value(
             1e-5
         )
@@ -583,12 +584,13 @@ class TestAqueousOnlySolver:
         prec = m.fs.precipitator
         prec.temperature.fix(298.15)
 
-        prec.aqueous_inlet.flow_vol[0].fix(1.0)
-        prec.aqueous_inlet.conc_mol_comp[0, "Ag+"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "Cl-"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "AgCl(aq)"].fix(1e-20)
-        prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1e-7)
-        prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(1e-7)
+        flow_vol = 1.0
+        prec.aqueous_inlet.flow_vol[0].fix(flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Ag+"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Cl-"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "AgCl(aq)"].fix(1e-20 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "H+"].fix(1e-7 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "OH-"].fix(1e-7 * flow_vol)
 
         for comp, c0 in [
             ("Ag+", 1e-4),
@@ -597,9 +599,9 @@ class TestAqueousOnlySolver:
             ("H+", 1e-7),
             ("OH-", 1e-7),
         ]:
-            prec.cv_aqueous.properties_out[0].conc_mol_comp[comp].set_value(c0)
+            prec.cv_aqueous.properties_out[0].flow_mol_comp[comp].set_value(c0 * flow_vol)
             prec.log_conc_out[comp].set_value(math.log(c0))
-        prec.cv_aqueous.properties_out[0].flow_vol.set_value(1.0)
+        prec.cv_aqueous.properties_out[0].flow_vol.set_value(flow_vol)
 
         solver = SolverFactory("ipopt")
         solver.options = {
@@ -679,12 +681,13 @@ class TestGasLiquidSolver:
         prec.temperature.fix(298.15)
 
         # Inlet set to the analytical equilibrium state for P_CO2 = 1.38 bar
-        prec.aqueous_inlet.flow_vol[0].fix(1.0)
-        prec.aqueous_inlet.conc_mol_comp[0, "CO2(aq)"].fix(4.619e-2)
-        prec.aqueous_inlet.conc_mol_comp[0, "HCO3-"].fix(1.436e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "CO3(2-)"].fix(4.677e-11)
-        prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1.436e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(7.009e-11)
+        flow_vol = 1.0
+        prec.aqueous_inlet.flow_vol[0].fix(flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "CO2(aq)"].fix(4.619e-2 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "HCO3-"].fix(1.436e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "CO3(2-)"].fix(4.677e-11 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "H+"].fix(1.436e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "OH-"].fix(7.009e-11 * flow_vol)
         prec.gas_inlet.moles_gas_comp[0, "CO2(g)"].fix(5.568e-2)
 
         # Initial guesses from equilibrium concentrations
@@ -696,9 +699,9 @@ class TestGasLiquidSolver:
             "OH-": 7.009e-11,
         }
         for comp, c0 in eq_concs.items():
-            prec.cv_aqueous.properties_out[0].conc_mol_comp[comp].set_value(c0)
+            prec.cv_aqueous.properties_out[0].flow_mol_comp[comp].set_value(c0 * flow_vol)
             prec.log_conc_out[comp].set_value(math.log(c0))
-        prec.cv_aqueous.properties_out[0].flow_vol.set_value(1.0)
+        prec.cv_aqueous.properties_out[0].flow_vol.set_value(flow_vol)
         prec.cv_gas.properties_out[0].moles_gas_comp["CO2(g)"].set_value(5.568e-2)
         prec.log_moles_gas_out["CO2(g)"].set_value(math.log(5.568e-2))
         prec.log_partial_pressure["CO2(g)"].set_value(math.log(1.38))
@@ -865,12 +868,13 @@ class TestVantHoffCorrection:
         prec = m.fs.precipitator
         prec.temperature.fix(T_proc)
 
-        prec.aqueous_inlet.flow_vol[0].fix(1.0)
-        prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1e-5)
-        prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(1e-9)
-        prec.aqueous_inlet.conc_mol_comp[0, "Ag+"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "Cl-"].fix(1e-4)
-        prec.aqueous_inlet.conc_mol_comp[0, "AgCl(aq)"].fix(1e-20)
+        flow_vol = 1.0
+        prec.aqueous_inlet.flow_vol[0].fix(flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "H+"].fix(1e-5 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "OH-"].fix(1e-9 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Ag+"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "Cl-"].fix(1e-4 * flow_vol)
+        prec.aqueous_inlet.flow_mol_comp[0, "AgCl(aq)"].fix(1e-20 * flow_vol)
 
         solver = SolverFactory("ipopt")
         solver.options = {"nlp_scaling_method": "user-scaling", "tol": 1e-8, "max_iter": 5000}

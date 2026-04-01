@@ -11,7 +11,7 @@ Authors: Chris Laliwala
 """
 
 from pyomo.common.config import ConfigValue
-from pyomo.environ import Set, Var
+from pyomo.environ import Expression, Set, Var
 from pyomo.environ import units as pyunits
 
 from idaes.core import (
@@ -87,8 +87,9 @@ class AqueousParameterData(PhysicalParameterBlock):
     def define_metadata(cls, obj):
         obj.define_custom_properties(
             {
-                "conc_mol_comp": {"method": None},
+                "flow_mol_comp": {"method": None},
                 "flow_vol": {"method": None},
+                "conc_mol_comp": {"method": None},
             }
         )
         obj.add_default_units(
@@ -114,7 +115,12 @@ class AqueousStateBlockData(StateBlockData):
 
     State variables:
       - flow_vol: volumetric flow rate (L/s)
-      - conc_mol_comp: molar concentration of each component (mol/L)
+      - flow_mol_comp: molar flow rate of each component (mol/s)
+
+    Derived quantity:
+      - conc_mol_comp: molar concentration (mol/L) = flow_mol_comp / flow_vol
+        Defined as an Expression so that IDAES Arcs and Mixers can sum molar
+        flows correctly across streams, with concentration computed automatically.
     """
 
     def build(self):
@@ -127,13 +133,20 @@ class AqueousStateBlockData(StateBlockData):
             doc="Volumetric flow rate (L/s)",
         )
 
-        self.conc_mol_comp = Var(
+        self.flow_mol_comp = Var(
             self.component_list,
-            units=pyunits.mol / pyunits.L,
+            units=pyunits.mol / pyunits.s,
             initialize=1e-6,
             bounds=(1e-20, None),
-            doc="Molar concentration of each aqueous component (mol/L)",
+            doc="Molar flow rate of each aqueous component (mol/s)",
         )
+
+        @self.Expression(
+            self.component_list,
+            doc="Molar concentration of each aqueous component (mol/L) = flow_mol_comp / flow_vol",
+        )
+        def conc_mol_comp(b, j):
+            return b.flow_mol_comp[j] / b.flow_vol
 
     def get_material_flow_basis(self):
         return MaterialFlowBasis.molar
@@ -141,5 +154,5 @@ class AqueousStateBlockData(StateBlockData):
     def define_state_vars(self):
         return {
             "flow_vol": self.flow_vol,
-            "conc_mol_comp": self.conc_mol_comp,
+            "flow_mol_comp": self.flow_mol_comp,
         }

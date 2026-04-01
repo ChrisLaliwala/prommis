@@ -34,9 +34,9 @@ Log-space variables are linked to linear-space variables via exponential constra
 
 .. math:: \min \sum_{r \in N_{rxn,sp}} (\ln(K_{r,sp}) - \ln(Q_r))^2
 
-**Aqueous mass balance** (CMI convention; r_extent in mol/L):
+**Aqueous mass balance** (molar flow form; r_extent in mol/L):
 
-.. math:: C_i^f = C_i^0 + \sum_r \alpha_{i,r} X_r
+.. math:: \dot{n}_i^f = \dot{n}_i^0 + \sum_r \alpha_{i,r} X_r \cdot \dot{V}
 
 **Precipitate mass balance**:
 
@@ -309,16 +309,20 @@ class OptPrecipitatorData(UnitModelBlockData):
         # Constraints
         # ------------------------------------------------------------------ #
 
-        # Link log variables to linear outlet concentrations
+        # Link log variables to linear outlet molar flows.
+        # log_conc_out[i] = ln(conc_out[i] / c_ref) where conc_out = flow_mol_out / flow_vol_out.
+        # Written as: flow_mol_out[i] = exp(log_conc_out[i]) * c_ref * flow_vol_out
         @self.Constraint(
             self.flowsheet().time,
             prop_aq.component_list,
-            doc="log_conc_out[i] = ln(conc_out[i] / c_ref)",
+            doc="log_conc_out[i] = ln(flow_mol_out[i] / (c_ref * flow_vol_out))",
         )
         def log_conc_linking_eqns(blk, t, i):
             return (
-                blk.cv_aqueous.properties_out[t].conc_mol_comp[i]
-                == pyo.exp(blk.log_conc_out[i]) * self.c_ref
+                blk.cv_aqueous.properties_out[t].flow_mol_comp[i]
+                == pyo.exp(blk.log_conc_out[i])
+                * self.c_ref
+                * blk.cv_aqueous.properties_out[t].flow_vol
             )
 
         # Aqueous reaction equilibrium: ln(K) = sum(alpha * log_conc_out)
@@ -355,19 +359,21 @@ class OptPrecipitatorData(UnitModelBlockData):
             def precip_sat_ineq(blk, r):
                 return blk.log_q_sp[r] <= blk.log_k[r]
 
-        # Aqueous mole balance: conc_out = conc_in + sum(alpha * rxn_extent)
+        # Aqueous mole balance (mol/s): flow_mol_out = flow_mol_in + sum(alpha * rxn_extent * flow_vol)
+        # rxn_extent is in mol/L; multiplied by flow_vol (L/s) gives mol/s.
+        # vol_balance enforces flow_vol_out == flow_vol_in, so either can be used here.
         @self.Constraint(
             self.flowsheet().time,
             prop_aq.component_list,
-            doc="Aqueous species mole balance",
+            doc="Aqueous species mole balance (mol/s)",
         )
         def aqueous_mole_balance_eqns(blk, t, i):
-            return blk.cv_aqueous.properties_out[t].conc_mol_comp[i] == (
-                blk.cv_aqueous.properties_in[t].conc_mol_comp[i]
+            return blk.cv_aqueous.properties_out[t].flow_mol_comp[i] == (
+                blk.cv_aqueous.properties_in[t].flow_mol_comp[i]
                 + sum(
                     prop_aq.stoich_aq_dict.get(r, {}).get(i, 0) * blk.rxn_extent[r]
                     for r in blk.merged_rxns
-                )
+                ) * blk.cv_aqueous.properties_out[t].flow_vol
             )
 
         # Volume balance: outlet flow = inlet flow

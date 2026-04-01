@@ -118,10 +118,10 @@ def build_model():
     # Fix process temperature (single-temperature solve)
     prec.temperature.fix(T)
 
-    # Fix aqueous inlet
+    # Fix aqueous inlet (molar flows = concentration × volumetric flow rate)
     prec.aqueous_inlet.flow_vol[0].fix(FLOW_VOL)
     for species, conc in C0.items():
-        prec.aqueous_inlet.conc_mol_comp[0, species].fix(conc)
+        prec.aqueous_inlet.flow_mol_comp[0, species].fix(conc * FLOW_VOL)
 
     return m
 
