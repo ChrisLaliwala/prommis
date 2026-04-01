@@ -21,7 +21,8 @@ Rxns 1–2 are aqueous equilibria (equality constraints).
 Rxn 3 is a precipitation / dissolution equilibrium — the saturation inequality
 drives the objective to push the system to the solubility product boundary.
 
-Van't Hoff correction applied by the caller:
+The Van't Hoff correction is applied **inside the model** using the ΔHᵣ values
+passed to the property package and the process temperature Var on the unit model:
 
     ln(K_T) = ln(K_T₀) + (ΔHᵣ/R) × (1/T₀ − 1/T)
 
@@ -40,36 +41,20 @@ from prommis.opt_precipitator.opt_precipitator import OptPrecipitator
 from prommis.opt_precipitator.precipitate_properties import PrecipitateParameter
 
 # ============================================================================
-# Thermodynamic data (pre-corrected to T = 320 K)
+# Thermodynamic data at T₀ = 298.15 K (reference temperature)
+# Van't Hoff correction is applied inside the model using dHr dicts
 # ============================================================================
 
 LN10 = math.log(10)
-R_GAS = 8.314  # J/mol/K
-T0 = 298.15  # K (reference temperature)
-T = 320.0  # K (process temperature)
-
-
-def vant_hoff_correction(log10_k_ref, dHr_J_per_mol):
-    """Return ln(K) at T using the Van't Hoff equation."""
-    ln_k_ref = log10_k_ref * LN10
-    correction = (dHr_J_per_mol / R_GAS) * (1.0 / T0 - 1.0 / T)
-    return ln_k_ref + correction
-
-
-#  Rxn 1: H₂O ⇌ H⁺ + OH⁻             log₁₀(K₂₉₈) = -13.997, ΔHᵣ = +55.8 kJ/mol
-LN_K_RXN1 = vant_hoff_correction(-13.997, +55_800)
-#  Rxn 2: Ag⁺ + Cl⁻ ⇌ AgCl(aq)       log₁₀(K₂₉₈) = +3.31,   ΔHᵣ = −12 kJ/mol
-LN_K_RXN2 = vant_hoff_correction(3.31, -12_000)
-#  Rxn 3: AgCl(s) ⇌ Ag⁺ + Cl⁻        log₁₀(K₂₉₈) = -9.75,   ΔHᵣ = +65.2 kJ/mol
-LN_K_RXN3 = vant_hoff_correction(-9.75, +65_200)
+T = 320.0  # K (process temperature — passed to temperature Var)
 
 # Aqueous components (mol/L); H₂O excluded — it is the solvent
 AQ_COMP_LIST = ["H+", "OH-", "Ag+", "Cl-", "AgCl(aq)"]
 
-# ln(K) for purely aqueous reactions (equality constraints)
+# ln(K) at T₀ = 298.15 K (reference, before Van't Hoff correction)
 LN_K_AQ_DICT = {
-    1: LN_K_RXN1,  # H2O -> H+ + OH-
-    2: LN_K_RXN2,  # Ag+ + Cl- -> AgCl(aq)
+    1: -13.997 * LN10,  # H₂O ⇌ H⁺ + OH⁻
+    2:    3.31  * LN10,  # Ag⁺ + Cl⁻ ⇌ AgCl(aq)
 }
 
 # Stoichiometry for aqueous species in ALL reactions (including precipitation rxn 3)
@@ -80,14 +65,23 @@ STOICH_AQ_DICT = {
     3: {"Ag+": 1, "Cl-": 1},  # dissolution gives Ag+ and Cl-
 }
 
+# ΔHr values for aqueous reactions (J/mol)
+DHR_AQ_DICT = {
+    1: +55_800,  # H₂O ⇌ H⁺ + OH⁻        endothermic
+    2: -12_000,  # Ag⁺ + Cl⁻ ⇌ AgCl(aq)  exothermic
+}
+
 # Solid (precipitate) components
 SP_COMP_LIST = ["AgCl(s)"]
 
-# ln(K) for precipitation reactions (saturation inequality + objective)
-LN_K_SP_DICT = {3: LN_K_RXN3}  # AgCl(s) ⇌ Ag+ + Cl-
+# ln(Ksp) at T₀ = 298.15 K
+LN_K_SP_DICT = {3: -9.75 * LN10}  # AgCl(s) ⇌ Ag⁺ + Cl⁻
 
 # Stoichiometry for solid species in precipitation reaction 3
 STOICH_SP_DICT = {3: {"AgCl(s)": -1}}  # AgCl(s) dissolves → negative
+
+# ΔHr for precipitation reaction (J/mol)
+DHR_SP_DICT = {3: +65_200}  # AgCl(s) ⇌ Ag⁺ + Cl⁻  endothermic
 
 # -----------------------------------------------------------------------
 # Initial conditions
@@ -121,20 +115,24 @@ def build_model():
         aqueous_comp_list=AQ_COMP_LIST,
         ln_k_aq_dict=LN_K_AQ_DICT,
         stoich_aq_dict=STOICH_AQ_DICT,
+        dHr_aq_dict=DHR_AQ_DICT,
     )
     m.fs.sp_props = PrecipitateParameter(
         precipitate_comp_list=SP_COMP_LIST,
         ln_k_sp_dict=LN_K_SP_DICT,
         stoich_sp_dict=STOICH_SP_DICT,
+        dHr_sp_dict=DHR_SP_DICT,
     )
 
     m.fs.prec = OptPrecipitator(
         property_package_aqueous=m.fs.aq_props,
         property_package_precipitate=m.fs.sp_props,
-        temperature=T,
     )
 
     prec = m.fs.prec
+
+    # Fix process temperature (single-temperature solve)
+    prec.temperature.fix(T)
 
     # Fix aqueous inlet
     prec.aqueous_inlet.flow_vol[0].fix(FLOW_VOL)
@@ -176,13 +174,14 @@ def print_results(m):
     print(f"AgCl Precipitation Example  (T = {T} K,  flow_vol = {FLOW_VOL} L/s)")
     print("=" * 65)
 
-    ln_k_labels = {
-        1: (LN_K_RXN1, "H₂O ⇌ H⁺ + OH⁻"),
-        2: (LN_K_RXN2, "Ag⁺ + Cl⁻ ⇌ AgCl(aq)"),
-        3: (LN_K_RXN3, "AgCl(s) ⇌ Ag⁺ + Cl⁻"),
+    rxn_k_labels = {
+        1: "H₂O ⇌ H⁺ + OH⁻",
+        2: "Ag⁺ + Cl⁻ ⇌ AgCl(aq)",
+        3: "AgCl(s) ⇌ Ag⁺ + Cl⁻",
     }
-    print("\nln(K) values at T=320K (Van't Hoff corrected):")
-    for r, (lnk, label) in ln_k_labels.items():
+    print(f"\nln(K) values at T={T} K (Van't Hoff corrected by model):")
+    for r, label in rxn_k_labels.items():
+        lnk = pyo.value(prec.log_k[r])
         print(f"  Rxn {r}: ln(K) = {lnk:.6f}  [{label}]")
 
     print("\nAqueous species concentrations:")

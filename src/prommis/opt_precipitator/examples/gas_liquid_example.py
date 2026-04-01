@@ -38,7 +38,8 @@ balance that arises from the CSV reaction set (where rxn_extent ≈ 7.5×10⁻�
 rxns A and B and the difference is only ~3×10⁻¹² for CO₃²⁻), allowing IPOPT to
 resolve the trace species (CO₃²⁻ ~ 4.6×10⁻¹¹, OH⁻ ~ 7.2×10⁻¹¹) accurately.
 
-Since T = 298.15 K (reference temperature), no Van't Hoff correction is needed:
+Since T = 298.15 K (reference temperature), no Van't Hoff correction is applied
+(ΔHr = 0 for all reactions, so dHr_aq_dict and dHr_gas_dict can be omitted):
     ln(K) = log₁₀(K) × ln(10)
 
 Gas property package parameters:
@@ -58,34 +59,22 @@ from idaes.core import FlowsheetBlock
 from prommis.opt_precipitator.aqueous_properties import AqueousParameter
 from prommis.opt_precipitator.gas_properties import GasParameter
 from prommis.opt_precipitator.opt_precipitator import OptPrecipitator
-from prommis.opt_precipitator.precipitate_properties import PrecipitateParameter
 
 # ============================================================================
-# Thermodynamic data (T = 298.15 K — no Van't Hoff correction needed)
+# Thermodynamic data at T₀ = 298.15 K (reference temperature)
+# T = T₀ here, so Van't Hoff correction is zero — dHr dicts can be omitted
 # ============================================================================
 
 LN10 = math.log(10)
-T = 298.15  # K
-
-# Rxn 1: H₂O ⇌ H⁺ + OH⁻                         log₁₀(K) = -13.997
-LN_K_RXN1 = -13.997 * LN10
-# Rxn 2: CO₂(aq) + H₂O ⇌ H⁺ + HCO₃⁻             log₁₀(K) = -6.3456  (= -16.681 + 10.3354)
-LN_K_RXN2 = (-16.681 + 10.3354) * LN10
-# Rxn 3: HCO₃⁻ ⇌ H⁺ + CO₃²⁻                      log₁₀(K) = -10.3354  (= -Rxn B from CSV)
-LN_K_RXN3 = -10.3354 * LN10
-# Rxn 4: CO₂(aq) ⇌ CO₂(g)                          log₁₀(K) = 3.245266 (Henry's law)
-LN_K_RXN4 = 3.245265839 * LN10
-
-# ============================================================================
-# Species and reaction data
-# ============================================================================
+T = 298.15  # K (process temperature = reference temperature)
 
 AQ_COMP_LIST = ["CO3(2-)", "H+", "CO2(aq)", "HCO3-", "OH-"]
 
+# ln(K) at T₀ = 298.15 K (reference, before Van't Hoff correction)
 LN_K_AQ_DICT = {
-    1: LN_K_RXN1,
-    2: LN_K_RXN2,
-    3: LN_K_RXN3,
+    1: -13.997 * LN10,                    # H₂O ⇌ H⁺ + OH⁻
+    2: (-16.681 + 10.3354) * LN10,        # CO₂(aq)+H₂O ⇌ H⁺+HCO₃⁻
+    3: -10.3354 * LN10,                   # HCO₃⁻ ⇌ H⁺+CO₃²⁻
 }
 
 # Stoichiometry for aqueous species in all reactions (H₂O excluded as solvent)
@@ -98,17 +87,12 @@ STOICH_AQ_DICT = {
 
 # Gas phase
 GAS_COMP_LIST = ["CO2(g)"]
-LN_K_GAS_DICT = {4: LN_K_RXN4}
+LN_K_GAS_DICT = {4: 3.245265839 * LN10}  # CO₂(aq) ⇌ CO₂(g), Henry's law
 STOICH_GAS_DICT = {4: {"CO2(aq)": -1, "CO2(g)": +1}}
 
 # Solvent properties for Henry's law: ρ/MW = 1000/18 = 55.56 mol/L
 RHO_SOLVENT = 1000.0  # g/L
 MW_SOLVENT = 18.0     # g/mol
-
-# Precipitate package — required by OptPrecipitator; no solids in this example
-SP_COMP_LIST = ["dummy(s)"]
-LN_K_SP_DICT = {}
-STOICH_SP_DICT = {}
 
 # ============================================================================
 # Initial conditions (MINTEQ values — near equilibrium for fast convergence)
@@ -143,11 +127,6 @@ def build_model():
         ln_k_aq_dict=LN_K_AQ_DICT,
         stoich_aq_dict=STOICH_AQ_DICT,
     )
-    m.fs.sp_props = PrecipitateParameter(
-        precipitate_comp_list=SP_COMP_LIST,
-        ln_k_sp_dict=LN_K_SP_DICT,
-        stoich_sp_dict=STOICH_SP_DICT,
-    )
     m.fs.gas_props = GasParameter(
         gas_comp_list=GAS_COMP_LIST,
         ln_k_gas_dict=LN_K_GAS_DICT,
@@ -158,20 +137,18 @@ def build_model():
 
     m.fs.prec = OptPrecipitator(
         property_package_aqueous=m.fs.aq_props,
-        property_package_precipitate=m.fs.sp_props,
         property_package_gas=m.fs.gas_props,
-        temperature=T,
     )
 
     prec = m.fs.prec
+
+    # Fix process temperature (T = T_ref here, so Van't Hoff correction is zero)
+    prec.temperature.fix(T)
 
     # Fix aqueous inlet
     prec.aqueous_inlet.flow_vol[0].fix(FLOW_VOL)
     for species, conc in C0.items():
         prec.aqueous_inlet.conc_mol_comp[0, species].fix(conc)
-
-    # Fix precipitate inlet (dummy solid at trace amount)
-    prec.precipitate_inlet.moles_precipitate_comp[0, "dummy(s)"].fix(1e-20)
 
     # Fix gas inlet
     prec.gas_inlet.moles_gas_comp[0, "CO2(g)"].fix(NG0_CO2G)
@@ -219,13 +196,15 @@ def print_results(m):
     print(f"CO₂/Carbonic Acid Gas-Liquid Example  (T = {T} K)")
     print("=" * 65)
 
-    print("\nln(K) values (T=298.15 K, no Van't Hoff correction):")
-    for r, (lnk, label) in {
-        1: (LN_K_RXN1, "H₂O ⇌ H⁺+OH⁻"),
-        2: (LN_K_RXN2, "CO₂(aq)+H₂O ⇌ H⁺+HCO₃⁻"),
-        3: (LN_K_RXN3, "HCO₃⁻ ⇌ H⁺+CO₃²⁻"),
-        4: (LN_K_RXN4, "CO₂(aq) ⇌ CO₂(g) [Henry]"),
-    }.items():
+    rxn_labels = {
+        1: "H₂O ⇌ H⁺+OH⁻",
+        2: "CO₂(aq)+H₂O ⇌ H⁺+HCO₃⁻",
+        3: "HCO₃⁻ ⇌ H⁺+CO₃²⁻",
+        4: "CO₂(aq) ⇌ CO₂(g) [Henry]",
+    }
+    print(f"\nln(K) values at T={T} K (Van't Hoff corrected by model):")
+    for r, label in rxn_labels.items():
+        lnk = pyo.value(prec.log_k[r])
         print(f"  Rxn {r}: ln(K) = {lnk:+.6f}  [{label}]")
 
     pyomo_ref = {

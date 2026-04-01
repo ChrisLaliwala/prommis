@@ -32,8 +32,9 @@ class PrecipitateParameterData(PhysicalParameterBlock):
 
     Requires the user to pass:
       - precipitate_comp_list: list of solid component names
-      - ln_k_sp_dict: dict mapping reaction index -> ln(Ksp) (natural log, temperature-corrected)
+      - ln_k_sp_dict: dict mapping reaction index -> ln(Ksp) at T_ref = 298.15 K (natural log)
       - stoich_sp_dict: nested dict {rxn_index: {component: stoich_coeff}} for precipitation reactions
+      - dHr_sp_dict: dict mapping reaction index -> ΔHr (J/mol); omit or leave empty for isothermal
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()
@@ -55,6 +56,15 @@ class PrecipitateParameterData(PhysicalParameterBlock):
             description="Nested dict {rxn_index: {component: stoich_coeff}} for precipitation reactions",
         ),
     )
+    CONFIG.declare(
+        "dHr_sp_dict",
+        ConfigValue(
+            default={},
+            domain=dict,
+            description="Dict {rxn_index: ΔHr (J/mol)} for precipitation reactions; "
+                        "reactions absent from dict are treated as isothermal (ΔHr = 0)",
+        ),
+    )
 
     def build(self):
         super().build()
@@ -69,6 +79,7 @@ class PrecipitateParameterData(PhysicalParameterBlock):
 
         self.ln_k_sp_dict = self.config.ln_k_sp_dict
         self.stoich_sp_dict = self.config.stoich_sp_dict
+        self.dHr_sp_dict = self.config.dHr_sp_dict
 
         self._state_block_class = PrecipitateStateBlock
 

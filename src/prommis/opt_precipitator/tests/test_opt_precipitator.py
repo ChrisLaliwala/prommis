@@ -237,6 +237,36 @@ class TestOptPrecipitatorBuild:
         assert hasattr(prec, "log_conc_out")
         assert hasattr(prec, "log_q_sp")
 
+    def test_temperature_var_exists(self, model):
+        import pyomo.environ as pyo
+        prec = model.fs.precipitator
+        assert hasattr(prec, "temperature")
+        assert isinstance(prec.temperature, pyo.ScalarVar)
+
+    def test_log_k_is_expression(self, model):
+        import pyomo.environ as pyo
+        prec = model.fs.precipitator
+        assert hasattr(prec, "log_k")
+        assert isinstance(prec.log_k, pyo.Expression)
+
+    def test_log_k_ref_param_exists(self, model):
+        import pyomo.environ as pyo
+        prec = model.fs.precipitator
+        assert hasattr(prec, "log_k_ref")
+        assert isinstance(prec.log_k_ref, pyo.Param)
+
+    def test_dHr_param_exists(self, model):
+        import pyomo.environ as pyo
+        prec = model.fs.precipitator
+        assert hasattr(prec, "dHr")
+        assert isinstance(prec.dHr, pyo.Param)
+
+    def test_T_ref_param_exists(self, model):
+        import pyomo.environ as pyo
+        prec = model.fs.precipitator
+        assert hasattr(prec, "T_ref")
+        assert isinstance(prec.T_ref, pyo.Param)
+
     def test_rxn_extent_covers_all_reactions(self, model):
         # merged_rxns spans both aqueous (1,2) and precipitation (3) reactions
         assert set(model.fs.precipitator.rxn_extent.keys()) == {1, 2, 3}
@@ -331,6 +361,7 @@ class TestPrecipitationSolver:
             property_package_precipitate=m.fs.sp_props,
         )
         prec = m.fs.precipitator
+        prec.temperature.fix(298.15)
 
         # Fix aqueous inlet (flow_vol in L/s, conc in mol/L)
         prec.aqueous_inlet.flow_vol[0].fix(2.0)
@@ -550,6 +581,7 @@ class TestAqueousOnlySolver:
             property_package_aqueous=m.fs.aq_props,
         )
         prec = m.fs.precipitator
+        prec.temperature.fix(298.15)
 
         prec.aqueous_inlet.flow_vol[0].fix(1.0)
         prec.aqueous_inlet.conc_mol_comp[0, "Ag+"].fix(1e-4)
@@ -642,9 +674,9 @@ class TestGasLiquidSolver:
         m.fs.precipitator = OptPrecipitator(
             property_package_aqueous=m.fs.aq_props,
             property_package_gas=m.fs.gas_props,
-            temperature=298.15,
         )
         prec = m.fs.precipitator
+        prec.temperature.fix(298.15)
 
         # Inlet set to the analytical equilibrium state for P_CO2 = 1.38 bar
         prec.aqueous_inlet.flow_vol[0].fix(1.0)
@@ -740,3 +772,115 @@ class TestGasLiquidSolver:
             + value(prec.cv_gas.properties_out[0].moles_gas_comp["CO2(g)"])
         )
         assert co2_in == pytest.approx(co2_out, rel=1e-4)
+
+
+# ===========================================================================
+# Van't Hoff Correction Tests
+# ===========================================================================
+
+R_GAS = 8.314      # J/(mol·K)
+T0 = 298.15        # K — reference temperature
+
+
+@pytest.mark.unit
+class TestVantHoffCorrection:
+    """
+    Verify that the Van't Hoff Expression in OptPrecipitator produces the
+    correct temperature-corrected ln(K) values.
+    """
+
+    def _build_aq_model(self, dHr_dict, T_fix):
+        """Helper: build a minimal aqueous-only model with given dHr and temperature."""
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+        m.fs.aq_props = AqueousParameter(
+            aqueous_comp_list=["H+", "OH-"],
+            ln_k_aq_dict={1: -13.997 * LN10},
+            stoich_aq_dict={1: {"H+": 1, "OH-": 1}},
+            dHr_aq_dict=dHr_dict,
+        )
+        m.fs.precipitator = OptPrecipitator(
+            property_package_aqueous=m.fs.aq_props,
+        )
+        m.fs.precipitator.temperature.fix(T_fix)
+        return m
+
+    def test_no_correction_at_T_ref(self):
+        """When T == T_ref, Van't Hoff correction is zero regardless of dHr."""
+        dHr = +55_800  # J/mol (water dissociation)
+        m = self._build_aq_model({1: dHr}, T_fix=T0)
+        prec = m.fs.precipitator
+        # log_k_ref stores the reference value; at T=T_ref correction is zero
+        assert value(prec.log_k[1]) == pytest.approx(
+            value(prec.log_k_ref[1]), rel=1e-10
+        )
+
+    def test_correction_applied_at_nonref_temperature(self):
+        """Van't Hoff expression gives the correct corrected ln(K) at T != T_ref."""
+        T_proc = 320.0  # K
+        dHr = +55_800   # J/mol
+        ln_k_ref = -13.997 * LN10
+
+        m = self._build_aq_model({1: dHr}, T_fix=T_proc)
+        prec = m.fs.precipitator
+
+        expected = ln_k_ref + (dHr / R_GAS) * (1.0 / T0 - 1.0 / T_proc)
+        assert value(prec.log_k[1]) == pytest.approx(expected, rel=1e-10)
+
+    def test_isothermal_reaction_unchanged(self):
+        """Reactions with dHr=0 have the same ln(K) at any temperature."""
+        T_proc = 350.0
+        m = self._build_aq_model({}, T_fix=T_proc)  # empty → dHr defaults to 0
+        prec = m.fs.precipitator
+        assert value(prec.log_k[1]) == pytest.approx(
+            value(prec.log_k_ref[1]), rel=1e-10
+        )
+
+    def test_all_aqueous_solver_at_320K(self):
+        """
+        Replicates the all_aqueous_example at T=320 K using reference ln(K) + dHr
+        and verifies outlet concentrations match expected values.
+        """
+        T_proc = 320.0
+        m = ConcreteModel()
+        m.fs = FlowsheetBlock(dynamic=False)
+        m.fs.aq_props = AqueousParameter(
+            aqueous_comp_list=["H+", "OH-", "Ag+", "Cl-", "AgCl(aq)"],
+            ln_k_aq_dict={
+                1: -13.997 * LN10,  # H2O ⇌ H+ + OH-    (at T0)
+                2:    3.31 * LN10,  # Ag+ + Cl- ⇌ AgCl(aq) (at T0)
+            },
+            stoich_aq_dict={
+                1: {"H+": 1, "OH-": 1},
+                2: {"Ag+": -1, "Cl-": -1, "AgCl(aq)": 1},
+            },
+            dHr_aq_dict={
+                1: +55_800,   # J/mol
+                2: -12_000,   # J/mol
+            },
+        )
+        m.fs.precipitator = OptPrecipitator(
+            property_package_aqueous=m.fs.aq_props,
+        )
+        prec = m.fs.precipitator
+        prec.temperature.fix(T_proc)
+
+        prec.aqueous_inlet.flow_vol[0].fix(1.0)
+        prec.aqueous_inlet.conc_mol_comp[0, "H+"].fix(1e-5)
+        prec.aqueous_inlet.conc_mol_comp[0, "OH-"].fix(1e-9)
+        prec.aqueous_inlet.conc_mol_comp[0, "Ag+"].fix(1e-4)
+        prec.aqueous_inlet.conc_mol_comp[0, "Cl-"].fix(1e-4)
+        prec.aqueous_inlet.conc_mol_comp[0, "AgCl(aq)"].fix(1e-20)
+
+        solver = SolverFactory("ipopt")
+        solver.options = {"nlp_scaling_method": "user-scaling", "tol": 1e-8, "max_iter": 5000}
+        result = solver.solve(m, tee=False)
+
+        from pyomo.opt import TerminationCondition
+        assert result.solver.termination_condition == TerminationCondition.optimal
+
+        # Verify expected concentrations (from all_aqueous_example.py validation)
+        ag_out = value(prec.cv_aqueous.properties_out[0].conc_mol_comp["Ag+"])
+        agcl_out = value(prec.cv_aqueous.properties_out[0].conc_mol_comp["AgCl(aq)"])
+        assert ag_out == pytest.approx(8.851e-5, rel=1e-3)
+        assert agcl_out == pytest.approx(1.149e-5, rel=1e-3)

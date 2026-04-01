@@ -71,6 +71,8 @@ import pyomo.environ as pyo
 from pyomo.common.config import Bool, ConfigBlock, ConfigValue
 from pyomo.environ import units as pyunits
 
+R_VANT_HOFF = 8.314  # J/(mol·K) — universal gas constant for Van't Hoff correction
+
 from idaes.core import (
     ControlVolume0DBlock,
     UnitModelBlockData,
@@ -148,7 +150,9 @@ class OptPrecipitatorData(UnitModelBlockData):
         ConfigValue(
             default=298.15,
             domain=float,
-            description="Process temperature (K); used in gas-phase ideal gas law",
+            description="Initial value (K) for the process temperature Var (bounds: 273.15–373.15). "
+                        "Call fix() after build for single-temperature solves, or leave free for "
+                        "temperature optimization. The Van't Hoff correction uses this Var.",
         ),
     )
     CONFIG.declare(
@@ -197,24 +201,72 @@ class OptPrecipitatorData(UnitModelBlockData):
             self.add_outlet_port(block=self.cv_precipitate, name="precipitate_outlet")
 
         # ------------------------------------------------------------------ #
-        # Merged reaction sets and ln(K) parameter
+        # Merged reaction sets, reference ln(K) values, and ΔHr data
         # Gas reactions are merged here so rxn_extent is built with the full
         # index set — avoids stale variable references if gas constraints are
         # added later in _build_gas_phase().
         # ------------------------------------------------------------------ #
-        self.merged_ln_k_dict = dict(prop_aq.ln_k_aq_dict)
+        self._merged_ln_k_ref_dict = dict(prop_aq.ln_k_aq_dict)
         if prop_sp is not None:
-            self.merged_ln_k_dict |= prop_sp.ln_k_sp_dict
+            self._merged_ln_k_ref_dict |= prop_sp.ln_k_sp_dict
         if self.config.property_package_gas is not None:
-            self.merged_ln_k_dict |= self.config.property_package_gas.ln_k_gas_dict
-        self.merged_rxns = list(self.merged_ln_k_dict.keys())
+            self._merged_ln_k_ref_dict |= self.config.property_package_gas.ln_k_gas_dict
+        self.merged_rxns = list(self._merged_ln_k_ref_dict.keys())
 
-        self.log_k = pyo.Param(
-            self.merged_rxns,
-            initialize=lambda m, r: self.merged_ln_k_dict[r],
-            within=pyo.Reals,
-            doc="ln(K) for each reaction (pre-corrected for temperature)",
+        # Build merged ΔHr dict; reactions absent from any package default to 0 (isothermal)
+        self._merged_dHr_dict = {r: 0.0 for r in self.merged_rxns}
+        for r, dh in prop_aq.dHr_aq_dict.items():
+            self._merged_dHr_dict[r] = dh
+        if prop_sp is not None:
+            for r, dh in prop_sp.dHr_sp_dict.items():
+                self._merged_dHr_dict[r] = dh
+        if self.config.property_package_gas is not None:
+            for r, dh in self.config.property_package_gas.dHr_gas_dict.items():
+                self._merged_dHr_dict[r] = dh
+
+        # Reference temperature for Van't Hoff correction (fixed at 298.15 K)
+        self.T_ref = pyo.Param(
+            initialize=298.15,
+            units=pyunits.K,
+            doc="Reference temperature for Van't Hoff correction (K); standard = 298.15 K",
         )
+
+        # Process temperature — Var so it can be a degree of freedom in optimization.
+        # Fix after building for single-temperature solves.
+        self.temperature = pyo.Var(
+            initialize=self.config.temperature,
+            bounds=(273.15, 373.15),
+            units=pyunits.K,
+            doc="Process temperature (K); fix() for single-T solve or leave free for optimization",
+        )
+
+        # Reference ln(K) values at T_ref (caller-supplied)
+        self.log_k_ref = pyo.Param(
+            self.merged_rxns,
+            initialize=lambda m, r: self._merged_ln_k_ref_dict[r],
+            within=pyo.Reals,
+            doc="ln(K) at T_ref for each reaction (natural log, caller-supplied at 298.15 K)",
+        )
+
+        # ΔHr for each reaction (J/mol); 0 → isothermal (ln(K) independent of temperature)
+        self.dHr = pyo.Param(
+            self.merged_rxns,
+            initialize=lambda m, r: self._merged_dHr_dict[r],
+            within=pyo.Reals,
+            doc="Standard enthalpy of reaction (J/mol); absent reactions default to 0",
+        )
+
+        # Van't Hoff corrected ln(K) at process temperature — Expression so it is
+        # automatically differentiable w.r.t. self.temperature
+        @self.Expression(
+            self.merged_rxns,
+            doc="ln(K) at process temperature via Van't Hoff: "
+                "log_k_ref[r] + (dHr[r]/R) * (1/T_ref − 1/T)",
+        )
+        def log_k(blk, r):
+            return blk.log_k_ref[r] + (blk.dHr[r] / R_VANT_HOFF) * (
+                1 / blk.T_ref - 1 / blk.temperature
+            )
 
         # Reference molality / concentration for log-space scaling (dimensionless)
         self.c_ref = pyo.Param(
@@ -454,6 +506,7 @@ class OptPrecipitatorData(UnitModelBlockData):
 
         # Ideal gas law: ln(P_i) - ln(ng_i) = ln(R*T/flow_vol)
         # i.e. P_i = (ng_i / flow_vol) * R * T   (treating ng/flow_vol as gas concentration)
+        # temperature is a Var on the block — split into constant + log(T) for clarity
         R_gas = 0.08314  # L·bar / mol / K
 
         @self.Constraint(
@@ -462,8 +515,8 @@ class OptPrecipitatorData(UnitModelBlockData):
             doc="Ideal gas law in log space (P = c_gas * R * T)",
         )
         def ideal_gas_eqns(blk, t, i):
-            return blk.log_partial_pressure[i] - blk.log_moles_gas_out[i] == pyo.log(
-                R_gas * self.config.temperature / flow_vol_in
+            return blk.log_partial_pressure[i] - blk.log_moles_gas_out[i] == (
+                pyo.log(R_gas / flow_vol_in) + pyo.log(blk.temperature)
             )
 
         # Gas mole balance: moles_gas_out = moles_gas_in + sum(alpha * rxn_extent * flow_vol)
@@ -497,7 +550,7 @@ class OptPrecipitatorData(UnitModelBlockData):
         return create_stream_table_dataframe(streams, time_point=time_point)
 
     def _get_performance_contents(self, time_point=0):
-        var_dict = {}
+        var_dict = {"Process temperature (K)": self.temperature}
         for r in self.merged_rxns:
             var_dict[f"Reaction {r} extent"] = self.rxn_extent[r]
         return {"vars": var_dict}

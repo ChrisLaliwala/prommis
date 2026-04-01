@@ -32,10 +32,11 @@ class GasParameterData(PhysicalParameterBlock):
 
     Requires the user to pass:
       - gas_comp_list: list of gas component names
-      - ln_k_gas_dict: dict mapping reaction index -> ln(K) for gas-liquid reactions
+      - ln_k_gas_dict: dict mapping reaction index -> ln(K) at T_ref = 298.15 K for gas-liquid reactions
       - stoich_gas_dict: nested dict {rxn_index: {component: stoich_coeff}} for gas reactions
       - rho_solvent: solvent density (g/L); default 1000.0 for water
       - MW_solvent: solvent molecular weight (g/mol); default 18.015 for water
+      - dHr_gas_dict: dict mapping reaction index -> ΔHr (J/mol); omit or leave empty for isothermal
 
     rho_solvent and MW_solvent are used by the unit model to compute the ρ/MW correction
     factor in the gas-liquid Henry's Law equilibrium constraint.
@@ -76,6 +77,15 @@ class GasParameterData(PhysicalParameterBlock):
             description="Solvent molecular weight (g/mol); default 18.015 for water",
         ),
     )
+    CONFIG.declare(
+        "dHr_gas_dict",
+        ConfigValue(
+            default={},
+            domain=dict,
+            description="Dict {rxn_index: ΔHr (J/mol)} for gas-liquid reactions; "
+                        "reactions absent from dict are treated as isothermal (ΔHr = 0)",
+        ),
+    )
 
     def build(self):
         super().build()
@@ -92,6 +102,7 @@ class GasParameterData(PhysicalParameterBlock):
         self.stoich_gas_dict = self.config.stoich_gas_dict
         self.rho_solvent = self.config.rho_solvent
         self.MW_solvent = self.config.MW_solvent
+        self.dHr_gas_dict = self.config.dHr_gas_dict
 
         self._state_block_class = GasStateBlock
 

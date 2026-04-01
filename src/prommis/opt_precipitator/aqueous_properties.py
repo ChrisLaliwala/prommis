@@ -32,8 +32,9 @@ class AqueousParameterData(PhysicalParameterBlock):
 
     Requires the user to pass:
       - aqueous_comp_list: list of aqueous component names
-      - ln_k_aq_dict: dict mapping reaction index -> ln(K) (natural log, temperature-corrected)
+      - ln_k_aq_dict: dict mapping reaction index -> ln(K) at T_ref = 298.15 K (natural log)
       - stoich_aq_dict: nested dict {rxn_index: {component: stoich_coeff}} for aqueous reactions
+      - dHr_aq_dict: dict mapping reaction index -> ΔHr (J/mol); omit or leave empty for isothermal
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()
@@ -55,6 +56,15 @@ class AqueousParameterData(PhysicalParameterBlock):
             description="Nested dict {rxn_index: {component: stoich_coeff}} for aqueous reactions",
         ),
     )
+    CONFIG.declare(
+        "dHr_aq_dict",
+        ConfigValue(
+            default={},
+            domain=dict,
+            description="Dict {rxn_index: ΔHr (J/mol)} for aqueous reactions; "
+                        "reactions absent from dict are treated as isothermal (ΔHr = 0)",
+        ),
+    )
 
     def build(self):
         super().build()
@@ -69,6 +79,7 @@ class AqueousParameterData(PhysicalParameterBlock):
 
         self.ln_k_aq_dict = self.config.ln_k_aq_dict
         self.stoich_aq_dict = self.config.stoich_aq_dict
+        self.dHr_aq_dict = self.config.dHr_aq_dict
 
         self._state_block_class = AqueousStateBlock
 
