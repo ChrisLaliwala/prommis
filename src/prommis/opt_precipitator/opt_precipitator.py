@@ -79,6 +79,7 @@ from idaes.core import (
     declare_process_block_class,
     useDefault,
 )
+import idaes.core.util.scaling as iscale
 from idaes.core.util.config import is_physical_parameter_block
 from idaes.core.util.tables import create_stream_table_dataframe
 
@@ -554,6 +555,61 @@ class OptPrecipitatorData(UnitModelBlockData):
             streams["Gas Inlet"] = self.gas_inlet
             streams["Gas Outlet"] = self.gas_outlet
         return create_stream_table_dataframe(streams, time_point=time_point)
+
+    def calculate_scaling_factors(self):
+        """Set default scaling factors for flow-independent variables and constraints.
+
+        This method handles variables whose magnitude does not depend on the volumetric
+        flow rate (FLOW_VOL). Flow-dependent variables (flow_vol, flow_mol_comp,
+        moles_precipitate_comp, rxn_extent for dissolution reactions) should be scaled
+        externally in the example script using iscale.set_scaling_factor() and
+        iscale.constraint_scaling_transform() after building the model.
+        """
+        super().calculate_scaling_factors()
+
+        prop_aq = self.config.property_package_aqueous
+        prop_sp = self.config.property_package_precipitate
+
+        # Temperature is fixed ~273–373 K; scaling factor ~3e-3 brings it to O(1).
+        if iscale.get_scaling_factor(self.temperature) is None:
+            iscale.set_scaling_factor(self.temperature, 1.0 / 320.0)
+
+        # log_conc_out is ln(C/c_ref) — dimensionless, typical range ±30.
+        # A scaling factor of 0.1 normalises values to O(1-3) after scaling.
+        for i in self.config.property_package_aqueous.component_list:
+            if iscale.get_scaling_factor(self.log_conc_out[i]) is None:
+                iscale.set_scaling_factor(self.log_conc_out[i], 0.1)
+
+        # log_q_sp is ln(Q) for precipitation reactions — same dimensionless argument.
+        if prop_sp is not None:
+            for r in prop_sp.rxn_set:
+                if iscale.get_scaling_factor(self.log_q_sp[r]) is None:
+                    iscale.set_scaling_factor(self.log_q_sp[r], 0.1)
+
+        # rxn_extent default (mol/L): 1.0 is a reasonable placeholder for aqueous reactions
+        # at typical concentrations.  The example script should override this for
+        # dissolution reactions where the extent is flow_vol-dependent.
+        for r in self.merged_rxns:
+            if iscale.get_scaling_factor(self.rxn_extent[r]) is None:
+                iscale.set_scaling_factor(self.rxn_extent[r], 1.0)
+
+        # Dimensionless equality constraints are already O(1) in log space.
+        # Apply transform(1.0) so iscale.unscaled_constraints_generator() does not
+        # flag them as unscaled.
+        for t in self.flowsheet().time:
+            for r in prop_aq.rxn_set:
+                c = self.aqueous_equil_eqns[t, r]
+                if iscale.get_constraint_transform_applied_scaling_factor(c) is None:
+                    iscale.constraint_scaling_transform(c, 1.0, overwrite=False)
+
+            if prop_sp is not None:
+                for r in prop_sp.rxn_set:
+                    c = self.log_q_precipitate_equilibrium_rxn_eqns[t, r]
+                    if iscale.get_constraint_transform_applied_scaling_factor(c) is None:
+                        iscale.constraint_scaling_transform(c, 1.0, overwrite=False)
+                    c_ineq = self.precip_sat_ineq[r]
+                    if iscale.get_constraint_transform_applied_scaling_factor(c_ineq) is None:
+                        iscale.constraint_scaling_transform(c_ineq, 1.0, overwrite=False)
 
     def _get_performance_contents(self, time_point=0):
         var_dict = {"Process temperature (K)": self.temperature}
