@@ -613,7 +613,9 @@ class OptPrecipitatorData(UnitModelBlockData):
 
     def _get_performance_contents(self, time_point=0):
         # rxn_extent is declared in mol/L; IDAES report() converts values to SI
-        # (mol/m³) but leaves bounds as raw floats, producing a misleading display.
-        # Extents are reported correctly by the flowsheet's print_results functions.
+        # (mol/m³, ×1000) but reads .bounds as raw floats without conversion.
+        # Putting extents in "exprs" avoids the misleading bounds column while
+        # still displaying the value and its SI-converted units correctly.
         var_dict = {"Process temperature (K)": self.temperature}
-        return {"vars": var_dict}
+        expr_dict = {f"Reaction {r} extent": self.rxn_extent[r] for r in self.merged_rxns}
+        return {"vars": var_dict, "exprs": expr_dict}
