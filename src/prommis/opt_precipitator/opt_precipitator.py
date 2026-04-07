@@ -291,7 +291,7 @@ class OptPrecipitatorData(UnitModelBlockData):
         self.log_conc_out = pyo.Var(
             prop_aq.component_list,
             initialize=-5,
-            bounds=(-50, 10),
+            bounds=(-60, 10),
             units=pyunits.dimensionless,
             doc="ln(C_out[i] / c_ref) for aqueous species i",
         )
@@ -301,7 +301,7 @@ class OptPrecipitatorData(UnitModelBlockData):
             self.log_q_sp = pyo.Var(
                 prop_sp.rxn_set,
                 initialize=-5,
-                bounds=(-50, 10),
+                bounds=(-60, 10),
                 units=pyunits.dimensionless,
                 doc="ln(Q_r) for precipitation reaction r (sum of alpha * log_conc_out)",
             )
@@ -446,7 +446,7 @@ class OptPrecipitatorData(UnitModelBlockData):
         self.log_partial_pressure = pyo.Var(
             prop_gas.component_list,
             initialize=0,
-            bounds=(-50, 4),
+            bounds=(-60, 4),
             units=pyunits.dimensionless,
             doc="ln(P_i / 1 bar) for gas species i",
         )
@@ -460,7 +460,7 @@ class OptPrecipitatorData(UnitModelBlockData):
         self.log_moles_gas_out = pyo.Var(
             prop_gas.component_list,
             initialize=-5,
-            bounds=(-50, 10),
+            bounds=(-60, 10),
             units=pyunits.dimensionless,
             doc="ln(moles_gas_out[i] / (1 mol/s)) for gas species i",
         )
