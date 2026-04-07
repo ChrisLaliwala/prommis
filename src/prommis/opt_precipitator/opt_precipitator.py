@@ -612,7 +612,8 @@ class OptPrecipitatorData(UnitModelBlockData):
                         iscale.constraint_scaling_transform(c_ineq, 1.0, overwrite=False)
 
     def _get_performance_contents(self, time_point=0):
+        # rxn_extent is declared in mol/L; IDAES report() converts values to SI
+        # (mol/m³) but leaves bounds as raw floats, producing a misleading display.
+        # Extents are reported correctly by the flowsheet's print_results functions.
         var_dict = {"Process temperature (K)": self.temperature}
-        for r in self.merged_rxns:
-            var_dict[f"Reaction {r} extent"] = self.rxn_extent[r]
         return {"vars": var_dict}
