@@ -83,6 +83,8 @@ import idaes.core.util.scaling as iscale
 from idaes.core.util.config import is_physical_parameter_block
 from idaes.core.util.tables import create_stream_table_dataframe
 
+from prommis.opt_precipitator.initializer import OptPrecipitatorInitializer
+
 
 @declare_process_block_class("OptPrecipitator")
 class OptPrecipitatorData(UnitModelBlockData):
@@ -98,6 +100,8 @@ class OptPrecipitatorData(UnitModelBlockData):
     gas_inlet / gas_outlet  *(present only when property_package_gas is provided)*
         Molar flow rates (mol/s) of gas-phase species.
     """
+
+    default_initializer = OptPrecipitatorInitializer
 
     CONFIG = UnitModelBlockData.CONFIG()
 
