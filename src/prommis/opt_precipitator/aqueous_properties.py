@@ -15,6 +15,7 @@ from pyomo.environ import Expression, Set, Var
 from pyomo.environ import units as pyunits
 
 from idaes.core import (
+    MaterialBalanceType,
     MaterialFlowBasis,
     Phase,
     PhysicalParameterBlock,
@@ -85,7 +86,7 @@ class AqueousParameterData(PhysicalParameterBlock):
 
     @classmethod
     def define_metadata(cls, obj):
-        obj.define_custom_properties(
+        obj.add_properties(
             {
                 "flow_mol_comp": {"method": None},
                 "flow_vol": {"method": None},
@@ -150,6 +151,12 @@ class AqueousStateBlockData(StateBlockData):
 
     def get_material_flow_basis(self):
         return MaterialFlowBasis.molar
+
+    def default_material_balance_type(self):
+        return MaterialBalanceType.componentTotal
+
+    def get_material_flow_terms(self, p, j):
+        return self.flow_mol_comp[j]
 
     def define_state_vars(self):
         return {
