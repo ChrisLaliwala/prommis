@@ -388,6 +388,21 @@ class OptPrecipitatorData(UnitModelBlockData):
                 == blk.cv_aqueous.properties_in[t].flow_vol
             )
 
+        # Precipitator volume for equipment sizing and costing.
+        # For a batch operation the reactor volume (L) equals the volumetric
+        # flow rate (L/s) because the model uses a 1-second residence-time
+        # basis: volume [L] = flow_vol [L/s] × 1 [s].
+        @self.Expression(
+            self.flowsheet().time,
+            doc="Precipitator volume (L) = flow_vol × 1 s (batch operation basis); "
+                "use pyunits.convert(prec.volume[t], to_units=pyunits.gal) for costing.",
+        )
+        def volume(blk, t):
+            return pyunits.convert(
+                blk.cv_aqueous.properties_in[t].flow_vol * (1 * pyunits.s),
+                to_units=pyunits.L,
+            )
+
         if prop_sp is not None:
             # Precipitate mole balance: moles_out = moles_in + sum(alpha * rxn_extent * flow_vol)
             @self.Constraint(
