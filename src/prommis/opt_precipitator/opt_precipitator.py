@@ -301,11 +301,15 @@ class OptPrecipitatorData(UnitModelBlockData):
         )
 
         # log(Q) for precipitation reactions (ion activity product in log space)
+        # Lower bound must be <= min(log_k_sp) to allow the saturation inequality
+        # log_q_sp[r] <= log_k[r] to be feasible.  For very insoluble minerals
+        # (e.g. Nd2(C2O4)3 with log_k = -71.63) a bound of -60 would make the
+        # constraint structurally infeasible.  Use -200 to cover all realistic Ksp.
         if prop_sp is not None:
             self.log_q_sp = pyo.Var(
                 prop_sp.rxn_set,
                 initialize=-5,
-                bounds=(-60, 10),
+                bounds=(-200, 50),
                 units=pyunits.dimensionless,
                 doc="ln(Q_r) for precipitation reaction r (sum of alpha * log_conc_out)",
             )
