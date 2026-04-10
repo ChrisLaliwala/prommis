@@ -82,7 +82,7 @@ class OptPrecipitatorInitializer(InitializerBase):
         self._m0_dissolution_solid = m0_dissolution_solid
         self._rxn_extent_bounds = rxn_extent_bounds or {}
 
-        super().initialize(
+        return super().initialize(
             model=model,
             initial_guesses=initial_guesses,
             json_file=json_file,
