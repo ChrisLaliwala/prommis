@@ -10,11 +10,245 @@ Optimization-based Precipitator
 
 Author: Chris Laliwala
 
-Equilibrium precipitator: aqueous speciation, precipitation/dissolution and (optionally)
-gas-liquid equilibria at a process temperature, written in log space. The saturation rule
-of the precipitation reactions is imposed either through the objective function of the
-original formulation (``formulation="objective"``) or as a complementarity constraint
-(``formulation="complementarity"``).
+Equilibrium precipitator for aqueous systems with precipitation/dissolution reactions
+and, optionally, gas-liquid equilibria. Equilibrium constants and solubility products
+are corrected to the process temperature with the Van't Hoff equation, all equilibrium
+relations are written in logarithmic variables, and the decision of which solids
+precipitate is made either by an objective function or by a complementarity constraint.
+
+Configuration Arguments
+-----------------------
+
+``property_package_aqueous``
+    :class:`~prommis.cmu_precipitator.aqueous_properties.AqueousParameter` block with
+    the aqueous species, the aqueous reactions and the aqueous stoichiometry of every
+    precipitation and gas-liquid reaction. Required.
+``property_package_precipitate``
+    :class:`~prommis.cmu_precipitator.precipitate_properties.PrecipitateParameter`
+    block with the solids and the solubility products. Optional; without it the unit
+    is a homogeneous aqueous equilibrium reactor.
+``property_package_gas``
+    :class:`~prommis.cmu_precipitator.gas_properties.GasParameter` block with the gas
+    species and the Henry-type equilibrium constants. Optional.
+``property_package_args_aqueous``, ``property_package_args_precipitate``, ``property_package_args_gas``
+    Arguments forwarded to the corresponding state blocks.
+``formulation``
+    ``"objective"`` (default) or ``"complementarity"``; see *Saturation rule* below.
+``temperature``
+    Initial value (K) of the process temperature variable; default 298.15.
+``gas_volume``
+    Gas-phase volume (L) for the ideal gas law. Default ``None`` uses the volume of
+    solution treated per batch; a float creates a mutable parameter ``gas_volume``.
+
+Model Structure
+---------------
+
+The unit has an aqueous control volume with ports ``aqueous_inlet`` and
+``aqueous_outlet`` (state variables ``flow_vol`` in L/s and ``flow_mol_comp`` in
+mol/s), a precipitate control volume with ports ``precipitate_inlet`` and
+``precipitate_outlet`` (``moles_precipitate_comp`` in mol/s) when a precipitate
+package is given, and a gas control volume with ports ``gas_inlet`` and ``gas_outlet``
+(``moles_gas_comp`` in mol/s) when a gas package is given. All quantities are flow
+rates; the amounts of one batch are the flow rates times ``t_batch`` (1 s).
+
+Unit variables, indexed by time :math:`t` where applicable:
+
+``temperature``, ``inv_temp``
+    Process temperature :math:`T` (K, bounded to 273.15-373.15 K) and its reciprocal.
+    Fix ``temperature`` for a single-temperature solve or leave it free as a decision.
+``rxn_extent[t, r]``
+    Extent :math:`X_r` of every reaction (mol/L of solution).
+``log_conc_out[t, j]``
+    :math:`\ell_j = \ln(C_j^{out} / c_{ref})` of every aqueous species,
+    :math:`c_{ref} = 1` mol/L.
+``log_q_sp[t, r]``
+    :math:`\ln Q_r` of every precipitation reaction.
+``partial_pressure[t, j]``, ``log_partial_pressure[t, j]``, ``log_moles_gas_out[t, j]``
+    Partial pressure :math:`P_j` (bar), :math:`\pi_j = \ln(P_j / p_{ref})` and
+    :math:`\nu_j = \ln(N_j^{out} / n_{ref})` of every gas species,
+    :math:`p_{ref} = 1` bar, :math:`n_{ref} = 1` mol/s.
+
+The reaction set of the unit, ``merged_rxns``, is the union of the reaction sets of the
+property packages, and ``log_k[r]`` is the expression for :math:`\ln K_r(T)`.
+
+Equations
+---------
+
+Temperature dependence of every equilibrium constant (Van't Hoff, with
+:math:`\Delta H_r = 0` for reactions without an entry in ``dHr_dict``):
+
+.. math:: \ln K_r(T) = \ln K_r(T_{ref}) + \frac{\Delta H_r}{R}
+   \left( \frac{1}{T_{ref}} - \frac{1}{T} \right) \quad (1)
+
+Log linking of the outlet flows and aqueous equilibrium of the homogeneous
+reactions :math:`N_{rxn,aq}`:
+
+.. math:: F_j^{out} = c_{ref} \, \dot V \, e^{\ell_j} \quad \forall j \in I_{aq} \quad (2)
+
+.. math:: \ln K_r(T) = \sum_{j \in I_{aq}} \alpha_{j,r} \, \ell_j
+   \quad \forall r \in N_{rxn,aq} \quad (3)
+
+where :math:`\alpha_{j,r}` is the stoichiometric coefficient of species :math:`j` in
+reaction :math:`r` (products positive) and :math:`\dot V` the volumetric flow rate.
+The ion product of every precipitation reaction :math:`N_{rxn,sp}`, written as a
+dissolution, is
+
+.. math:: \ln Q_r = \sum_{j \in I_{aq}} \alpha_{j,r} \, \ell_j
+   \quad \forall r \in N_{rxn,sp} \quad (4)
+
+Mole balances close the system:
+
+.. math:: F_j^{out} = F_j^{in} + \dot V \sum_{r} \alpha_{j,r} X_r
+   \quad \forall j \in I_{aq} \quad (5)
+
+.. math:: N_i^{out} = N_i^{in} + \dot V \sum_{r \in N_{rxn,sp}} \alpha_{i,r} X_r
+   \quad \forall i \in I_{sp} \quad (6)
+
+.. math:: \dot V^{out} = \dot V^{in} \quad (7)
+
+Saturation rule
+^^^^^^^^^^^^^^^
+
+A solid :math:`i` dissolved by reaction :math:`r` is either absent from the outlet or
+in equilibrium with the solution. With ``formulation="objective"`` the unit follows the
+law-of-mass-action approach of [1]: it adds the constraint
+
+.. math:: \ln Q_r \le \ln K_r(T) \quad \forall r \in N_{rxn,sp} \quad (8)
+
+and the objective
+
+.. math:: \min \; z = \sum_{r \in N_{rxn,sp}} \left( \ln K_r(T) - \ln Q_r \right)^2
+   \quad (9)
+
+so that a solid precipitates until saturation when it can, and dissolves completely
+otherwise. The unit then carries an active objective (``min_logs``); a flowsheet
+with its own objective should use the complementarity form. With
+``formulation="complementarity"`` the same rule is the complementarity condition
+
+.. math:: 0 \le N_i^{out} \; \perp \; \ln K_r(T) - \ln Q_r \ge 0
+   \quad \forall r \in N_{rxn,sp} \quad (10)
+
+built as the ``pyomo.mpec`` component ``precipitation_complementarity``. It is left
+untransformed so that the user chooses the treatment; see *Solving the complementarity
+formulation*.
+
+Gas phase
+^^^^^^^^^
+
+Every gas-liquid reaction :math:`N_{rxn,gas}` is a Henry-type equilibrium between the
+dissolved species and the partial pressure of the gas. The equilibrium constant is
+defined on the mole fraction of the dissolved species, which the solvent density
+:math:`\rho` and molecular weight :math:`MW` of the gas package convert to a
+concentration:
+
+.. math:: \ln K_r(T) = \sum_{j \in I_{gas}} \alpha_{j,r}
+   \left( \pi_j + \ln \frac{\rho}{MW} \right)
+   + \sum_{j \in I_{aq}} \alpha_{j,r} \, \ell_j
+   \quad \forall r \in N_{rxn,gas} \quad (11)
+
+The gas leaving the unit obeys the ideal gas law over the gas volume :math:`V_{gas}`
+(``gas_volume``, or the volume of solution treated per batch), written between the
+log variables,
+
+.. math:: \pi_j - \nu_j = \ln \frac{n_{ref} \, t_{batch} \, R \, T}{V_{gas} \, p_{ref}}
+   \quad \forall j \in I_{gas} \quad (12)
+
+with the linking constraints :math:`P_j = p_{ref} e^{\pi_j}` and
+:math:`N_j^{out} = n_{ref} e^{\nu_j}`, and the gas mole balance
+
+.. math:: N_j^{out} = N_j^{in} + \dot V \sum_{r \in N_{rxn,gas}} \alpha_{j,r} X_r
+   \quad \forall j \in I_{gas} \quad (13)
+
+Degrees of Freedom
+------------------
+
+With the inlet states and the temperature fixed the unit has one degree of freedom
+per precipitation reaction: the amount of each solid, which the saturation rule
+decides. Both formulations report this count from
+:func:`idaes.core.util.model_statistics.degrees_of_freedom`, because the objective and
+the complementarity are not counted as equality constraints. A unit without a
+precipitate package is square.
+
+Initialization
+--------------
+
+:class:`PrecipitatorInitializer` seeds the outlet at the inlet composition (or at the
+``outlet_conc`` guesses, mol/L), the log variables from those concentrations, the gas
+outlet from Henry's law at the inlet composition capped by the aqueous inventory of
+its constituents, and the extents at zero (or at ``rxn_extent_seeds``), then solves the
+unit with the IDAES default solver at ``tol=1e-8``; a looser absolute tolerance leaves
+trace species, and with them the log variables, unresolved. With
+``formulation="complementarity"`` and an untransformed complementarity the
+initialization is an aqueous-equilibrium seed with the precipitation extents held at
+zero; the full unit is solved after the transformation.
+
+Scaling
+-------
+
+:class:`PrecipitatorScaler` scales the flows by their magnitude (the inlet value, and
+for a solid or gas formed in the unit the aqueous inventory of its constituents), the
+log variables by 0.1, the temperature by 0.01, and every constraint by the inverse of
+its largest term. Because IPOPT's tolerances are absolute, trace species are resolved
+only in a scaled model or at a tight tolerance. The recommended workflow is
+
+.. code-block:: python
+
+    scaler = m.fs.unit.default_scaler()
+    scaler.scale_model(m.fs.unit)
+    m.fs.unit.default_initializer().initialize(m.fs.unit)
+    solver = get_solver("ipopt_v2")  # applies the scaling factors in the writer
+    solver.solve(m)
+
+Re-running ``scale_model(m.fs.unit, overwrite=True)`` after initialization refreshes
+the flow scaling from the initialized values.
+
+Solving the complementarity formulation
+---------------------------------------
+
+The complementarity condition (10) is not a constraint a nonlinear programming solver
+can take directly. ``pyomo.mpec`` provides the transformations, applied to the model
+after initialization:
+
+``mpec.simple_nonlinear``
+    Regularization of [2]: each condition becomes
+    :math:`N_i^{out} \, (\ln K_r - \ln Q_r) \le \epsilon` together with the two
+    inequalities, with :math:`\epsilon` the mutable parameter ``mpec_bound`` created on
+    the transformed model. Solve at a moderate :math:`\epsilon`, then decrease it and
+    re-solve from the previous point. Keep :math:`\epsilon` small but strictly
+    positive (1e-6 to 1e-8): at :math:`\epsilon = 0` the constraint qualifications fail
+    at points where a solid is exactly at saturation with none present, and the
+    solver's convergence checks become unreliable.
+``mpec.simple_disjunction``
+    Disjunctive (GDP) form, for a subsequent ``gdp.bigm`` or ``gdp.hull``
+    transformation and a mixed-integer solver.
+``mpec.nl``
+    Keeps the complementarity in the NL file for solvers that accept it, such as
+    PATH and Knitro.
+
+The unit adds no objective in this formulation; a feasibility problem needs
+``Objective(expr=0)`` and an optimization flowsheet uses its own objective. With IPOPT
+the continuation warm starts from the previous solve
+(``warm_start_init_point="yes"`` with small ``warm_start_bound_push`` and
+``warm_start_mult_bound_push``), for example
+
+.. code-block:: python
+
+    from pyomo.environ import Objective, TransformationFactory
+
+    m.fs.unit.default_initializer().initialize(m.fs.unit)
+    TransformationFactory("mpec.simple_nonlinear").apply_to(m, mpec_bound=1e-2)
+    m.obj = Objective(expr=0)
+    solver = get_solver("ipopt_v2")
+    for eps in (1e-2, 1e-4, 1e-6, 1e-8):
+        m.mpec_bound.set_value(eps)
+        solver.solve(m)
+
+[1] A. M. M. Leal, D. A. Kulik, W. R. Smith, and M. O. Saar. An overview of
+computational methods for chemical equilibrium and kinetic calculations for
+geochemical and reactive transport modeling. *Pure Appl. Chem.*, 89:597-643, 2017.
+
+[2] S. Scholtes. Convergence properties of a regularization scheme for mathematical
+programs with complementarity constraints. *SIAM J. Optim.*, 11:918-936, 2001.
 """
 
 import math

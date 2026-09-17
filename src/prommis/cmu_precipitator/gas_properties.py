@@ -4,10 +4,43 @@
 # University of California, through Lawrence Berkeley National Laboratory, et al. All rights reserved.
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
-"""
-Gas-phase property package for the optimization-based precipitator model.
+r"""
+Gas Property Package for the Optimization-based Precipitator
+============================================================
 
-Authors: Chris Laliwala
+Author: Chris Laliwala
+
+Holds the gas species and the Henry-type equilibrium constants and stoichiometry of the
+gas-liquid reactions of the :mod:`prommis.cmu_precipitator.opt_based_precipitator`
+unit model.
+
+Configuration Arguments
+-----------------------
+
+``gas_comp_list``
+    List of gas species.
+``logkeq_dict``
+    ``{reaction: log10(K)}`` at 298.15 K, one entry per gas-liquid reaction written in
+    the direction dissolved species → gas, with the equilibrium constant defined on the
+    partial pressure of the gas (bar) and the mole fraction of the dissolved species.
+    The keys define the gas-liquid reaction set, ``rxn_set``.
+``stoich_dict``
+    ``{reaction: {species: coefficient}}`` over both the gas species (positive) and the
+    dissolved aqueous species (negative) of each gas-liquid reaction. The aqueous species
+    must also be declared under the same reaction name in the aqueous property package.
+``dHr_dict``
+    Optional ``{reaction: standard enthalpy of reaction (J/mol)}`` for the Van't Hoff
+    correction; reactions absent from the dictionary are treated as isothermal.
+``rho_solvent``, ``MW_solvent``
+    Density (g/L, default 1000.0) and molecular weight (g/mol, default 18.015) of the
+    solvent, which convert the mole-fraction basis of the equilibrium constants to the
+    molar concentrations used by the unit model.
+
+State Variables
+---------------
+
+``moles_gas_comp``
+    Molar flow rate of each gas species (mol/s), bounded below by 1e-20 mol/s.
 """
 
 import math
@@ -32,15 +65,12 @@ LN10 = math.log(10.0)
 @declare_process_block_class("GasParameter")
 class GasParameterData(PhysicalParameterBlock):
     """
-    Property package for gas-phase species.
+    Parameter block for the gas species.
 
-    The user passes a list of gas components (gas_comp_list), a dictionary of the
-    gas-liquid equilibrium constants in log10 form (logkeq_dict), a dictionary of the
-    stoichiometry of every gas-liquid reaction over both gas and aqueous species
-    (stoich_dict), optionally a dictionary of standard reaction enthalpies (dHr_dict,
-    J/mol) for the Van't Hoff temperature correction, and the solvent density (g/L) and
-    molecular weight (g/mol) used to convert the solvent mole fraction basis of the
-    equilibrium constants to concentrations.
+    Builds ``component_list``, the gas-liquid reaction set ``rxn_set``, the
+    dictionaries ``stoich_dict``, ``logkeq_dict`` (log10), ``ln_k_dict`` (natural log)
+    and ``dHr_dict``, and the solvent properties ``rho_solvent`` and ``MW_solvent``
+    read by the unit model.
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()

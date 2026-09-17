@@ -99,6 +99,7 @@ CMU Precipitator
    prommis.cmu_precipitator.opt_based_precipitator
    prommis.cmu_precipitator.aqueous_properties
    prommis.cmu_precipitator.precipitate_properties
+   prommis.cmu_precipitator.gas_properties
 
 Ion Exchange 
 ------------

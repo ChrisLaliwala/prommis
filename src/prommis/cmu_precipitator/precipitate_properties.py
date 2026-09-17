@@ -4,10 +4,38 @@
 # University of California, through Lawrence Berkeley National Laboratory, et al. All rights reserved.
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
-"""
-Precipitate property package for the optimization-based precipitator model.
+r"""
+Precipitate Property Package for the Optimization-based Precipitator
+====================================================================
 
-Authors: Chris Laliwala
+Author: Chris Laliwala
+
+Holds the solid species and the solubility products and stoichiometry of the
+precipitation/dissolution reactions of the
+:mod:`prommis.cmu_precipitator.opt_based_precipitator` unit model.
+
+Configuration Arguments
+-----------------------
+
+``precipitate_comp_list``
+    List of solid species.
+``logkeq_dict``
+    ``{reaction: log10(Ksp)}`` at 298.15 K, one entry per dissolution reaction written
+    in the direction solid → ions. The keys define the precipitation reaction set,
+    ``rxn_set``.
+``stoich_dict``
+    ``{reaction: {solid: coefficient}}`` over the solid species. The dissolving solid
+    carries a negative coefficient; the ions it releases are declared, with positive
+    coefficients, under the same reaction name in the aqueous property package.
+``dHr_dict``
+    Optional ``{reaction: standard enthalpy of dissolution (J/mol)}`` for the Van't
+    Hoff correction; reactions absent from the dictionary are treated as isothermal.
+
+State Variables
+---------------
+
+``moles_precipitate_comp``
+    Molar flow rate of each solid species (mol/s), bounded below by 1e-20 mol/s.
 """
 
 import math
@@ -32,14 +60,11 @@ LN10 = math.log(10.0)
 @declare_process_block_class("PrecipitateParameter")
 class PrecipitateParameterData(PhysicalParameterBlock):
     """
-    Property package for precipitate species.
+    Parameter block for the solid species.
 
-    The user passes a list of precipitate components (precipitate_comp_list), a dictionary
-    of the solubility products of the precipitation/dissolution reactions in log10 form
-    (logkeq_dict), a dictionary of the precipitate stoichiometry of every reaction
-    (stoich_dict; the dissolving solid carries a negative coefficient), and optionally a
-    dictionary of standard reaction enthalpies (dHr_dict, J/mol) used for the Van't Hoff
-    temperature correction of the solubility products.
+    Builds ``component_list``, the precipitation reaction set ``rxn_set``, and the
+    dictionaries ``stoich_dict``, ``logkeq_dict`` (log10), ``ln_k_dict`` (natural log)
+    and ``dHr_dict`` read by the unit model.
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()

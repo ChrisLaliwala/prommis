@@ -4,10 +4,43 @@
 # University of California, through Lawrence Berkeley National Laboratory, et al. All rights reserved.
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
-"""
-Aqueous component property package for the optimization-based precipitator model.
+r"""
+Aqueous Property Package for the Optimization-based Precipitator
+================================================================
 
-Authors: Chris Laliwala
+Author: Chris Laliwala
+
+Holds the aqueous species, the equilibrium constants and stoichiometry of the reactions
+between them, and the aqueous side of the precipitation and gas-liquid reactions of the
+:mod:`prommis.cmu_precipitator.opt_based_precipitator` unit model.
+
+Configuration Arguments
+-----------------------
+
+``aqueous_comp_list``
+    List of aqueous species. The solvent (water) is not a species: it has unit activity
+    and is omitted from every stoichiometry dictionary.
+``logkeq_dict``
+    ``{reaction: log10(K)}`` at 298.15 K for the aqueous (homogeneous) reactions. The
+    keys of this dictionary define the set of aqueous reactions, ``rxn_set``.
+``stoich_dict``
+    ``{reaction: {species: coefficient}}`` with products positive and reactants
+    negative. It must contain the aqueous reactions and also the aqueous species of
+    every precipitation and gas-liquid reaction declared in the precipitate and gas
+    property packages, keyed by the same reaction names.
+``dHr_dict``
+    Optional ``{reaction: standard enthalpy of reaction (J/mol)}`` for the Van't Hoff
+    correction; reactions absent from the dictionary are treated as isothermal.
+
+State Variables
+---------------
+
+``flow_vol``
+    Volumetric flow rate of solution (L/s).
+``flow_mol_comp``
+    Molar flow rate of each aqueous species (mol/s), bounded below by 1e-20 mol/s.
+
+The concentration ``conc_mol_comp`` (mol/L) is an expression, ``flow_mol_comp / flow_vol``.
 """
 
 import math
@@ -33,14 +66,11 @@ LN10 = math.log(10.0)
 @declare_process_block_class("AqueousParameter")
 class AqueousParameterData(PhysicalParameterBlock):
     """
-    Property package for aqueous species.
+    Parameter block for the aqueous species.
 
-    The user passes a list of aqueous components (aqueous_comp_list), a dictionary of
-    the aqueous equilibrium constants in log10 form (logkeq_dict), a dictionary of the
-    aqueous stoichiometry of every reaction (stoich_dict; it must also cover the aqueous
-    species of precipitation and gas-liquid reactions), and optionally a dictionary of
-    standard reaction enthalpies (dHr_dict, J/mol) used for the Van't Hoff temperature
-    correction of the aqueous reactions.
+    Builds ``component_list``, the aqueous reaction set ``rxn_set``, and the
+    dictionaries ``stoich_dict``, ``logkeq_dict`` (log10), ``ln_k_dict`` (natural log)
+    and ``dHr_dict`` read by the unit model.
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()
