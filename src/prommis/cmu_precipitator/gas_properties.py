@@ -5,7 +5,7 @@
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
 """
-Aqueous component property package for the optimization-based precipitator model.
+Gas-phase property package for the optimization-based precipitator model.
 
 Authors: Chris Laliwala
 """
@@ -17,7 +17,6 @@ from pyomo.environ import Set, Var
 from pyomo.environ import units as pyunits
 
 from idaes.core import (
-    MaterialBalanceType,
     MaterialFlowBasis,
     Phase,
     PhysicalParameterBlock,
@@ -30,36 +29,38 @@ from idaes.core.util.initialization import fix_state_vars
 LN10 = math.log(10.0)
 
 
-@declare_process_block_class("AqueousParameter")
-class AqueousParameterData(PhysicalParameterBlock):
+@declare_process_block_class("GasParameter")
+class GasParameterData(PhysicalParameterBlock):
     """
-    Property package for aqueous species.
+    Property package for gas-phase species.
 
-    The user passes a list of aqueous components (aqueous_comp_list), a dictionary of
-    the aqueous equilibrium constants in log10 form (logkeq_dict), a dictionary of the
-    aqueous stoichiometry of every reaction (stoich_dict; it must also cover the aqueous
-    species of precipitation and gas-liquid reactions), and optionally a dictionary of
-    standard reaction enthalpies (dHr_dict, J/mol) used for the Van't Hoff temperature
-    correction of the aqueous reactions.
+    The user passes a list of gas components (gas_comp_list), a dictionary of the
+    gas-liquid equilibrium constants in log10 form (logkeq_dict), a dictionary of the
+    stoichiometry of every gas-liquid reaction over both gas and aqueous species
+    (stoich_dict), optionally a dictionary of standard reaction enthalpies (dHr_dict,
+    J/mol) for the Van't Hoff temperature correction, and the solvent density (g/L) and
+    molecular weight (g/mol) used to convert the solvent mole fraction basis of the
+    equilibrium constants to concentrations.
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()
     CONFIG.declare(
-        "aqueous_comp_list",
-        ConfigValue(domain=list, description="List of aqueous components in process"),
+        "gas_comp_list",
+        ConfigValue(domain=list, description="List of gas-phase components in process"),
     )
     CONFIG.declare(
         "logkeq_dict",
         ConfigValue(
             domain=dict,
-            description="Dictionary of aqueous equilibrium constants, log10(K) at 298.15 K",
+            description="Dictionary of gas-liquid equilibrium constants, log10(K) at 298.15 K",
         ),
     )
     CONFIG.declare(
         "stoich_dict",
         ConfigValue(
             domain=dict,
-            description="Dictionary {reaction: {aqueous component: stoichiometric coefficient}}",
+            description="Dictionary {reaction: {component: stoichiometric coefficient}} "
+            "over the gas and aqueous species of each gas-liquid reaction",
         ),
     )
     CONFIG.declare(
@@ -71,17 +72,33 @@ class AqueousParameterData(PhysicalParameterBlock):
             "reactions absent from the dictionary are treated as isothermal",
         ),
     )
+    CONFIG.declare(
+        "rho_solvent",
+        ConfigValue(
+            default=1000.0,
+            domain=float,
+            description="Solvent density (g/L); default 1000.0 for water",
+        ),
+    )
+    CONFIG.declare(
+        "MW_solvent",
+        ConfigValue(
+            default=18.015,
+            domain=float,
+            description="Solvent molecular weight (g/mol); default 18.015 for water",
+        ),
+    )
 
     def build(self):
         """
-        Callable method for Block construction.
+        Callable method for block construction.
         """
         super().build()
 
-        self.AqueousPhase = Phase()
-        self.component_list = self.config.aqueous_comp_list
+        self.GasPhase = Phase()
+        self.component_list = self.config.gas_comp_list
 
-        # aqueous equilibrium reaction index
+        # gas-liquid equilibrium reaction index
         self.rxn_set = Set(initialize=list(self.config.logkeq_dict.keys()))
 
         # stoichiometry, log10(K), ln(K) and enthalpy of each reaction
@@ -90,16 +107,18 @@ class AqueousParameterData(PhysicalParameterBlock):
         self.ln_k_dict = {r: v * LN10 for r, v in self.config.logkeq_dict.items()}
         self.dHr_dict = self.config.dHr_dict
 
-        self._state_block_class = AqueousStateBlock
+        # solvent properties for the mole-fraction to concentration conversion
+        self.rho_solvent = self.config.rho_solvent
+        self.MW_solvent = self.config.MW_solvent
+
+        self._state_block_class = GasStateBlock
 
     @classmethod
     def define_metadata(cls, obj):
         """Define properties supported and units."""
         obj.define_custom_properties(
             {
-                "flow_vol": {"method": None},
-                "flow_mol_comp": {"method": None},
-                "conc_mol_comp": {"method": None},
+                "moles_gas_comp": {"method": None},
             }
         )
         obj.add_default_units(
@@ -113,7 +132,7 @@ class AqueousParameterData(PhysicalParameterBlock):
         )
 
 
-class _AqueousStateBlock(StateBlock):
+class _GasStateBlock(StateBlock):
     def fix_initialization_states(self):
         """
         Fixes state variables for state blocks.
@@ -125,48 +144,27 @@ class _AqueousStateBlock(StateBlock):
         return fix_state_vars(self)
 
 
-@declare_process_block_class("AqueousStateBlock", block_class=_AqueousStateBlock)
-class AqueousStateBlockData(StateBlockData):
+@declare_process_block_class("GasStateBlock", block_class=_GasStateBlock)
+class GasStateBlockData(StateBlockData):
     """
-    State block for the aqueous species.
-
-    State variables are the volumetric flow rate (L/s) and the molar flow rate of each
-    component (mol/s); the molar concentration (mol/L) is an Expression.
+    State block for the gas-phase species.
     """
 
     def build(self):
         super().build()
 
-        self.flow_vol = Var(
-            units=pyunits.L / pyunits.s,
-            initialize=1,
-            bounds=(1e-8, None),
-            doc="Volumetric flow rate of the solution",
-        )
-
-        self.flow_mol_comp = Var(
+        self.moles_gas_comp = Var(
             self.component_list,
             units=pyunits.mol / pyunits.s,
-            initialize=1e-6,
+            initialize=1e-20,
             bounds=(1e-20, None),
-            doc="Molar flow rate of each aqueous component",
+            doc="Molar flow rate of each gas-phase component",
         )
-
-        @self.Expression(self.component_list, doc="Molar concentration (mol/L)")
-        def conc_mol_comp(b, j):
-            return b.flow_mol_comp[j] / b.flow_vol
 
     def get_material_flow_basis(self):
         return MaterialFlowBasis.molar
 
-    def default_material_balance_type(self):
-        return MaterialBalanceType.componentTotal
-
-    def get_material_flow_terms(self, p, j):
-        return self.flow_mol_comp[j]
-
     def define_state_vars(self):
         return {
-            "flow_vol": self.flow_vol,
-            "flow_mol_comp": self.flow_mol_comp,
+            "moles_gas_comp": self.moles_gas_comp,
         }

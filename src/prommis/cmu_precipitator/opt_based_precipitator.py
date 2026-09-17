@@ -5,93 +5,394 @@
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
 r"""
-Optimization-based Precipitator for the Critical Materials Innovation Hub (CMI) Process
-=======================================================================================
+Optimization-based Precipitator
+===============================
 
 Author: Chris Laliwala
 
-This precipitator makes use of equilibrium constants and solubility constants to predict the final concentrations of aqueous species,
-and the amount of precipitates formed at equilibrium.
-
-Configuration Arguments
------------------------
-
-The model requires the user to define the aqueous species and precipitates present in the system. Additionally,
-equilibrium constants for aqueous reactions, and solubility constants for precipitation/dissolution reactions are needed.
-Reaction stoichiometry must also be provided by the user. The aqueous components, equilibrium constants, and a dictionary
-defining the aqueous reaction stoichiometry is stored in the aqeuous property package. The precipitates, solubility constants,
-and a dictionary defining the precipitation/dissolution reaction stoichiometry is stored in the precipitate property package.
-
-Model Structure
----------------
-
-This unit model has an inlet for aqueous ('aqueous_inlet') and precipitates ('precipitate_inlet') entering the unit, and an outlet for
-aqueous ('aqueous_outlet') and precipitates ('precipitate_outlet') leaving the unit.
-
-
-Additional Model Information
-----------------------------
-
-This precipitator model seeks to model aqueous systems involving precipitation and dissolution reactions as chemical equilibrium problems.
-The approach taken here is to solve a system of nonlinear equations involving equilibrium constants (the law of mass action approach, LMA) [1].
-Instead of utilizing saturation indices heuristics commonly used by LMA software [1], this model formulates an optimization problem where the
-objective function is to minimize the square difference between the ion product, :math:`Q_{r,sp}`, defined over the actual concentration in solution,
-and the solubility constant, :math:`K_{r,sp}`, defined over the equilibrium concentration in solution,
-
-.. math:: z = \sum_{r \in N_{rxn,sp}} ( log(K_{r,sp}) - log(Q_{r,sp}) )^2 \quad (1)
-
-where :math:`N_{rxn,sp}` is the set of precipitation/dissolution reactions. By adding in the following constraints, this objective function allows the
-identification of the species that should precipitate (i.e. :math:`Q_{r,sp} = K_{r,sp}`) and those that should not (i.e. :math:`Q_{r,sp} \leq K_{r,sp}`):
-
-.. math:: log(Q_{r,sp}) = \sum_{i \in I_{r, products}} \alpha_{i,r} log(C_i^f) \forall r \in N_{rxn,sp} \quad (2)
-
-.. math:: log(Q_{r,sp}) \leq log(K_{r,sp}) \forall r \in N_{rxn,sp} \quad (3)
-
-where :math:`I_{r,products}` is the set of products formed in reaction :math:`r`. Eq. (2) computes the ionic product based on the actual concentrations in
-the solution; its upper bound is defined by the solubility product (Eq. 3).
-
-Equilibrium conditions are imposed in all reactions that do not involve solids' formation as shown in Eq. (4):
-
-.. math:: log(K_{r,aq}) = \sum_{i \in I_{r,products}} \alpha_{i,r} log(C_i^f) - \sum_{i \in I_{r, reactants}} \alpha_{i,r} log(C_i^f) \forall r \in N_{rxn,aq} \quad (4)
-
-where :math:`\alpha_{i,r}` is the stoichiometric coefficient of species :math:`i` in reaction :math:`r`, :math:`C_i^f` is the equilibrium concentration of
-species :math:`i`, and :math:`N_{rxn,aq}` is the set of all aqueous reactions. The logartihmic form(s) in Eq. (2-4) to minimize numerical issues.
-
-The set of restrictions is completed with the inclusion of mass and concentration balances to calculate the final concentration/mass of species:
-
-.. math:: C_i^f = C_i^0 + \sum_{r \in N_{rxn,i}} \alpha_{i,r} X_r \forall i \in I_{aq} \quad (5)
-
-.. math:: m_i^f = m_i^0 + \sum_{r \in N_{rxn,i}} \alpha_{i,r} X_r V \forall i \in I_{sp} \quad (6)
-
-where :math:`C_i^0` is the initial concentration of species :math:`i`, :math:`N_{rxn,i}` is the set of all reactions involving species :math:`i`, :math:`X_r`
-is the extent of reaction :math:`r`, :math:`I_{aq}` is the set of all aqueous species, :math:`m_i^0` is the initial amount of solid species :math:`i`,
-:math:`V` is the volumetric flowrate of solvent, and :math:`I_{sp}` is the set of all precipitates.
-
-[1] Allan M.M. Leal, Dmitrii A. Kulik, William R. Smith, and Martin O. Saar. An overview of computational methods for chemical equilibrium and kinetic calculations for
-geochemical and reactive transport modeling. *Pure Appl. Chem.*, 89:597-643, 2017.
+Equilibrium precipitator: aqueous speciation, precipitation/dissolution and (optionally)
+gas-liquid equilibria at a process temperature, written in log space. The saturation rule
+of the precipitation reactions is imposed either through the objective function of the
+original formulation (``formulation="objective"``) or as a complementarity constraint
+(``formulation="complementarity"``).
 """
 
-# Import Pyomo libraries
-import pyomo.environ as pyo
-from pyomo.common.config import Bool, ConfigBlock, ConfigValue
-from pyomo.environ import units as pyunits
+import math
 
-# Import IDAES cores
+import pyomo.environ as pyo
+from pyomo.common.collections import ComponentMap
+from pyomo.common.config import ConfigBlock, ConfigValue, In
+from pyomo.environ import units as pyunits
+from pyomo.mpec import Complementarity, complements
+
+import idaes.logger as idaeslog
 from idaes.core import (
     ControlVolume0DBlock,
     UnitModelBlockData,
     declare_process_block_class,
     useDefault,
 )
+from idaes.core.initialization import ModularInitializerBase
+from idaes.core.scaling import ConstraintScalingScheme, CustomScalerBase
+from idaes.core.solvers import get_solver
 from idaes.core.util.config import is_physical_parameter_block
+from idaes.core.util.exceptions import InitializationError
+from idaes.core.util.model_statistics import degrees_of_freedom
 from idaes.core.util.tables import create_stream_table_dataframe
+
+_log = idaeslog.getLogger(__name__)
+
+R_GAS = 8.314  # J/(mol K), Van't Hoff correction
+R_GAS_L_BAR = 0.08314  # L bar/(mol K), ideal gas law
+T_REF = 298.15  # K, reference temperature of the equilibrium constants
+
+
+def _constituent_inventory(model, sb_in, prop, j):
+    """
+    Largest inlet flow (mol/s) among the aqueous species taking part in the reactions
+    that form component ``j`` of property package ``prop``; a solid or gas formed in
+    the unit is bounded by the aqueous inventory of its constituents.
+    """
+    prop_aq = model.config.property_package_aqueous
+    inventory = 0.0
+    for r, coeffs in prop.stoich_dict.items():
+        if coeffs.get(j, 0) == 0:
+            continue
+        for k, nu in prop_aq.stoich_dict.get(r, {}).items():
+            if nu != 0 and k in sb_in.flow_mol_comp:
+                inventory = max(
+                    inventory,
+                    abs(pyo.value(sb_in.flow_mol_comp[k], exception=False) or 0.0),
+                )
+    return inventory
+
+
+class PrecipitatorScaler(CustomScalerBase):
+    """
+    Scaler for the optimization-based precipitator.
+
+    Flows are scaled by their magnitude: the inlet value, the current value, and for
+    a solid or gas formed in the unit the aqueous inventory of its constituents. The
+    log-space and temperature variables use the default factors below.
+    """
+
+    DEFAULT_SCALING_FACTORS = {
+        "temperature": 1e-2,
+        "inv_temp": 1e2,
+        "log_conc_out": 1e-1,
+        "log_q_sp": 1e-1,
+        "rxn_extent": 1e0,
+        "log_partial_pressure": 1e-1,
+        "partial_pressure": 1e0,
+        "log_moles_gas_out": 1e-1,
+    }
+
+    def _scale_by_value(
+        self, var, overwrite, reference=None, magnitude=0.0, floor=1e-10
+    ):
+        """
+        Scale a variable by the inverse of its magnitude. The magnitude is the larger
+        of the variable's current value and that of ``reference`` (an inlet
+        counterpart), so outlet flows inherit the inlet scaling until they have been
+        initialized; re-running the scaler with ``overwrite=True`` after initialization
+        refreshes the factors from the initialized values.
+        """
+        if not overwrite and self.get_scaling_factor(var) is not None:
+            return
+        val = abs(pyo.value(var, exception=False) or 0.0)
+        if reference is not None:
+            val = max(val, abs(pyo.value(reference, exception=False) or 0.0))
+        val = max(val, magnitude)
+        self.set_variable_scaling_factor(
+            var, 1.0 / max(val, floor), overwrite=overwrite
+        )
+
+    def variable_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: ComponentMap = None
+    ):
+        """
+        Variable scaling routine.
+
+        Args:
+            model: instance of Precipitator to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: ComponentMap of Scalers to use for sub-models
+
+        Returns:
+            None
+        """
+        for t in model.flowsheet().time:
+            sb_in = model.cv_aqueous.properties_in[t]
+            sb_out = model.cv_aqueous.properties_out[t]
+            self._scale_by_value(sb_in.flow_vol, overwrite)
+            self._scale_by_value(sb_out.flow_vol, overwrite, reference=sb_in.flow_vol)
+            for j in sb_in.flow_mol_comp:
+                self._scale_by_value(sb_in.flow_mol_comp[j], overwrite)
+                self._scale_by_value(
+                    sb_out.flow_mol_comp[j], overwrite, reference=sb_in.flow_mol_comp[j]
+                )
+            if hasattr(model, "cv_precipitate"):
+                sp_in = model.cv_precipitate.properties_in[t]
+                sp_out = model.cv_precipitate.properties_out[t]
+                for j in sp_in.moles_precipitate_comp:
+                    self._scale_by_value(sp_in.moles_precipitate_comp[j], overwrite)
+                    self._scale_by_value(
+                        sp_out.moles_precipitate_comp[j],
+                        overwrite,
+                        reference=sp_in.moles_precipitate_comp[j],
+                        magnitude=_constituent_inventory(
+                            model, sb_in, model.config.property_package_precipitate, j
+                        ),
+                    )
+            if hasattr(model, "cv_gas"):
+                g_in = model.cv_gas.properties_in[t]
+                g_out = model.cv_gas.properties_out[t]
+                for j in g_in.moles_gas_comp:
+                    self._scale_by_value(g_in.moles_gas_comp[j], overwrite)
+                    self._scale_by_value(
+                        g_out.moles_gas_comp[j],
+                        overwrite,
+                        reference=g_in.moles_gas_comp[j],
+                        magnitude=_constituent_inventory(
+                            model, sb_in, model.config.property_package_gas, j
+                        ),
+                    )
+
+        self.scale_variable_by_default(model.temperature, overwrite=overwrite)
+        self.scale_variable_by_default(model.inv_temp, overwrite=overwrite)
+        for name in (
+            "log_conc_out",
+            "log_q_sp",
+            "rxn_extent",
+            "log_partial_pressure",
+            "partial_pressure",
+            "log_moles_gas_out",
+        ):
+            if hasattr(model, name):
+                for v in getattr(model, name).values():
+                    self.scale_variable_by_default(v, overwrite=overwrite)
+
+    def constraint_scaling_routine(
+        self, model, overwrite: bool = False, submodel_scalers: ComponentMap = None
+    ):
+        """
+        Constraint scaling routine.
+
+        Args:
+            model: instance of Precipitator to be scaled
+            overwrite: whether to overwrite existing scaling factors
+            submodel_scalers: ComponentMap of Scalers to use for sub-models
+
+        Returns:
+            None
+        """
+        for name in (
+            "inv_temp_definition",
+            "log_conc_linking_eqns",
+            "aqueous_equilibrium_eqns",
+            "log_q_precipitate_equilibrium_rxn_eqns",
+            "precip_sat_ineq",
+            "aqueous_mole_balance_eqns",
+            "vol_balance",
+            "precipitate_mole_balance_eqns",
+            "log_pressure_linking_eqns",
+            "log_moles_gas_linking_eqns",
+            "gas_equilibrium_eqns",
+            "ideal_gas_eqns",
+            "gas_mole_balance_eqns",
+        ):
+            if hasattr(model, name):
+                for condata in getattr(model, name).values():
+                    self.scale_constraint_by_nominal_value(
+                        condata,
+                        scheme=ConstraintScalingScheme.inverseMaximum,
+                        overwrite=overwrite,
+                    )
+
+
+class PrecipitatorInitializer(ModularInitializerBase):
+    """
+    Initializer for the optimization-based precipitator.
+
+    Outlet flows and log-space variables are seeded from the inlet (or from the
+    ``outlet_conc`` guesses, mol/L, when given) and the unit is solved. With
+    ``formulation="complementarity"`` and an untransformed complementarity component,
+    the solve is an aqueous-equilibrium seed with the precipitation extents held at
+    zero; the complementarity itself must be transformed (``pyomo.mpec``) by the user
+    before the full model is solved.
+    """
+
+    CONFIG = ModularInitializerBase.CONFIG()
+    CONFIG.declare(
+        "outlet_conc",
+        ConfigValue(
+            default=None,
+            description="Optional {aqueous component: concentration (mol/L)} guesses "
+            "for the outlet; components not listed start from the inlet",
+        ),
+    )
+    CONFIG.declare(
+        "rxn_extent_seeds",
+        ConfigValue(
+            default=None,
+            description="Optional {reaction: extent (mol/L)} guesses",
+        ),
+    )
+
+    def precheck(self, model):
+        """
+        Degrees-of-freedom check: one degree of freedom per precipitation reaction is
+        expected (the amount of each solid is decided by the saturation rule).
+        """
+        expected = 0
+        if model.config.property_package_precipitate is not None:
+            expected = len(model.config.property_package_precipitate.rxn_set)
+        dof = degrees_of_freedom(model)
+        if dof != expected:
+            raise InitializationError(
+                f"Degrees of freedom of {model.name} were not equal to the number of "
+                f"precipitation reactions ({expected}): {dof}."
+            )
+
+    def _get_solver(self):
+        # trace species: an absolute tolerance looser than 1e-8 leaves their flows,
+        # and hence their log-space variables, unresolved
+        if self._solver is None:
+            options = dict(self.config.solver_options)
+            options.setdefault("tol", 1e-8)
+            self._solver = get_solver(
+                self.config.solver,
+                solver_options=options,
+                writer_config=self.config.writer_config,
+            )
+        return self._solver
+
+    @staticmethod
+    def _seed_gas_phase(model, t, props_in):
+        """
+        Seed the gas outlet from Henry's law at the inlet composition, capped by the
+        aqueous inventory of the constituents of each gas species.
+        """
+        prop_aq = model.config.property_package_aqueous
+        prop_gas = model.config.property_package_gas
+        g_in = model.cv_gas.properties_in[t]
+        g_out = model.cv_gas.properties_out[t]
+        ln_rho_over_mw = math.log(prop_gas.rho_solvent / prop_gas.MW_solvent)
+        rt = R_GAS_L_BAR * pyo.value(model.temperature)  # L bar / mol
+        vol = pyo.value(model.gas_volume_basis[t])  # L
+        t_batch = pyo.value(model.t_batch)  # s
+        for j in g_in.moles_gas_comp:
+            n = max(pyo.value(g_in.moles_gas_comp[j]), 1e-20)
+            for r, coeffs in prop_gas.stoich_dict.items():
+                nu_j = coeffs.get(j, 0)
+                if nu_j == 0:
+                    continue
+                log_p = (
+                    pyo.value(model.log_k[r])
+                    - sum(
+                        nu * pyo.value(model.log_conc_out[t, k])
+                        for k, nu in prop_aq.stoich_dict.get(r, {}).items()
+                        if nu != 0
+                    )
+                ) / nu_j - ln_rho_over_mw
+                n_henry = math.exp(log_p) * vol / rt / t_batch
+                inventory = _constituent_inventory(model, props_in, prop_gas, j)
+                n = max(n, min(n_henry, inventory))
+            g_out.moles_gas_comp[j].set_value(n)
+            model.log_moles_gas_out[t, j].set_value(math.log(n))
+            p = max(pyo.value(model.partial_pressure_from_moles[t, j]), 1e-15)
+            model.partial_pressure[t, j].set_value(p)
+            model.log_partial_pressure[t, j].set_value(math.log(p))
+
+    def initialize_main_model(self, model):
+        """
+        Seed the outlet and log-space variables and solve the unit.
+
+        Args:
+            model: instance of Precipitator to be initialized
+
+        Returns:
+            solver results
+        """
+        outlet_conc = self.config.outlet_conc or {}
+        extent_seeds = self.config.rxn_extent_seeds or {}
+        prop_aq = model.config.property_package_aqueous
+
+        model.inv_temp.set_value(1.0 / pyo.value(model.temperature))
+        for t in model.flowsheet().time:
+            props_in = model.cv_aqueous.properties_in[t]
+            props_out = model.cv_aqueous.properties_out[t]
+            fv = pyo.value(props_in.flow_vol)
+            props_out.flow_vol.set_value(fv)
+            for j in prop_aq.component_list:
+                if j in outlet_conc:
+                    c = max(outlet_conc[j], 1e-20)
+                else:
+                    c = max(pyo.value(props_in.flow_mol_comp[j]) / fv, 1e-20)
+                props_out.flow_mol_comp[j].set_value(c * fv)
+                model.log_conc_out[t, j].set_value(math.log(c))
+            if hasattr(model, "cv_precipitate"):
+                sp_in = model.cv_precipitate.properties_in[t]
+                sp_out = model.cv_precipitate.properties_out[t]
+                for j in sp_in.moles_precipitate_comp:
+                    sp_out.moles_precipitate_comp[j].set_value(
+                        pyo.value(sp_in.moles_precipitate_comp[j])
+                    )
+                for r in model.config.property_package_precipitate.rxn_set:
+                    model.log_q_sp[t, r].set_value(
+                        pyo.value(
+                            sum(
+                                prop_aq.stoich_dict[r][j] * model.log_conc_out[t, j]
+                                for j in prop_aq.stoich_dict.get(r, {})
+                            )
+                        )
+                    )
+            if hasattr(model, "cv_gas"):
+                self._seed_gas_phase(model, t, props_in)
+            for r in model.merged_rxns:
+                model.rxn_extent[t, r].set_value(extent_seeds.get(r, 0.0))
+
+        solver = self._get_solver()
+
+        untransformed = hasattr(model, "precipitation_complementarity") and any(
+            c.active for c in model.precipitation_complementarity.values()
+        )
+        if untransformed:
+            # aqueous-equilibrium seed: no precipitation, complementarity switched off
+            model.precipitation_complementarity.deactivate()
+            held = []
+            for t in model.flowsheet().time:
+                for r in model.config.property_package_precipitate.rxn_set:
+                    v = model.rxn_extent[t, r]
+                    if not v.fixed:
+                        v.fix(0.0)
+                        held.append(v)
+            try:
+                results = solver.solve(
+                    model, tee=self.config.output_level < idaeslog.INFO
+                )
+            finally:
+                for v in held:
+                    v.unfix()
+                model.precipitation_complementarity.activate()
+            _log.info(
+                "%s: complementarity formulation seeded with the precipitation "
+                "extents at zero; transform the complementarity before solving.",
+                model.name,
+            )
+            return results
+
+        return solver.solve(model, tee=self.config.output_level < idaeslog.INFO)
 
 
 @declare_process_block_class("Precipitator")
 class PrecipitatorData(UnitModelBlockData):
     """
-    Precipitator Unit Model Class
+    Optimization-based Precipitator Unit Model Class
     """
+
+    default_initializer = PrecipitatorInitializer
+    default_scaler = PrecipitatorScaler
 
     CONFIG = UnitModelBlockData.CONFIG()
 
@@ -103,7 +404,7 @@ class PrecipitatorData(UnitModelBlockData):
             description="Property package to use for aqueous control volume",
             doc="""Property parameter object used to define property calculations,
 **default** - useDefault.
-"Valid values:** {
+**Valid values:** {
 **useDefault** - use default package from parent model or flowsheet,
 **PropertyParameterObject** - a PropertyParameterBlock object.}""",
         ),
@@ -123,13 +424,13 @@ see property package for documentation.}""",
     CONFIG.declare(
         "property_package_precipitate",
         ConfigValue(
-            default=useDefault,
+            default=None,
             domain=is_physical_parameter_block,
             description="Property package to use for precipitate control volume",
             doc="""Property parameter object used to define property calculations,
-**default** - useDefault.
+**default** - None (no precipitates).
 **Valid values:** {
-**useDefault** - use default package from parent model or flowsheet,
+**None** - no precipitate phase,
 **PropertyParameterObject** - a PropertyParameterBlock object.}""",
         ),
     )
@@ -146,45 +447,66 @@ see property package for documentation.}""",
         ),
     )
     CONFIG.declare(
-        "has_equilibrium_reactions",
+        "property_package_gas",
         ConfigValue(
-            default=True,
-            domain=Bool,
-            description="Equilibrium reaction construction flag",
-            doc="""Indicates whether terms for equilibrium controlled reactions
-should be constructed,
-**default** - True.
+            default=None,
+            domain=is_physical_parameter_block,
+            description="Property package to use for gas control volume",
+            doc="""Property parameter object used to define property calculations,
+**default** - None (no gas phase).
 **Valid values:** {
-**True** - include equilibrium reaction terms,
-**False** - exclude equilibrium reaction terms.}""",
+**None** - no gas phase,
+**PropertyParameterObject** - a PropertyParameterBlock object.}""",
         ),
     )
     CONFIG.declare(
-        "has_phase_equilibrium",
-        ConfigValue(
-            default=False,
-            domain=Bool,
-            description="Phase equilibrium construction flag",
-            doc="""Indicates whether terms for phase equilibrium should be
-constructed,
-**default** = False.
+        "property_package_args_gas",
+        ConfigBlock(
+            implicit=True,
+            description="Arguments to use for constructing gas property packages",
+            doc="""A ConfigBlock with arguments to be passed to a property block(s)
+and used when constructing these,
+**default** - None.
 **Valid values:** {
-**True** - include phase equilibrium terms
-**False** - exclude phase equilibrium terms.}""",
+see property package for documentation.}""",
         ),
     )
     CONFIG.declare(
-        "has_heat_of_reaction",
+        "formulation",
         ConfigValue(
-            default=False,
-            domain=Bool,
-            description="Heat of reaction term construction flag",
-            doc="""Indicates whether terms for heat of reaction terms should be
-constructed,
-**default** - False.
+            default="objective",
+            domain=In(["objective", "complementarity"]),
+            description="Formulation of the saturation rule of the precipitation reactions",
+            doc="""Formulation of the saturation rule of the precipitation reactions,
+**default** - "objective".
 **Valid values:** {
-**True** - include heat of reaction terms,
-**False** - exclude heat of reaction terms.}""",
+**"objective"** - the unit carries the objective min sum (ln K - ln Q)^2 with ln Q <= ln K,
+**"complementarity"** - n_solid >= 0 complements (ln K - ln Q) >= 0, built as a
+pyomo.mpec Complementarity component that the user transforms before solving.}""",
+        ),
+    )
+    CONFIG.declare(
+        "temperature",
+        ConfigValue(
+            default=T_REF,
+            domain=float,
+            description="Initial value of the process temperature (K)",
+            doc="""Initial value of the process temperature variable (K), bounded to
+273.15-373.15 K; fix it for a single-temperature solve or leave it free as a decision.
+The equilibrium constants are corrected from 298.15 K with the Van't Hoff equation.""",
+        ),
+    )
+    CONFIG.declare(
+        "gas_volume",
+        ConfigValue(
+            default=None,
+            description="Gas-phase volume (L) for the ideal gas law",
+            doc="""Gas-phase volume (L) used in the ideal gas law of the gas species,
+**default** - None: the volume of solution treated per batch, i.e. the aqueous inlet
+volumetric flow rate over one second.
+**Valid values:** {
+**None** - use the solution volume,
+**float** - a fixed gas volume (L), stored as a mutable Parameter.}""",
         ),
     )
 
@@ -196,176 +518,430 @@ constructed,
         Return:
             None
         """
-        # Call UnitModel.build to setup dynamics
-        super(PrecipitatorData, self).build()
+        super().build()
 
-        # Add Control Volumes
+        prop_aq = self.config.property_package_aqueous
+        prop_sp = self.config.property_package_precipitate
+        prop_gas = self.config.property_package_gas
+        time = self.flowsheet().time
+
+        # ----------------------------------------------------------------- #
+        # Control volumes and ports
+        # ----------------------------------------------------------------- #
         self.cv_aqueous = ControlVolume0DBlock(
             dynamic=False,
             has_holdup=False,
-            property_package=self.config.property_package_aqueous,
+            property_package=prop_aq,
             property_package_args=self.config.property_package_args_aqueous,
         )
-        self.cv_precipitate = ControlVolume0DBlock(
-            dynamic=False,
-            has_holdup=False,
-            property_package=self.config.property_package_precipitate,
-            property_package_args=self.config.property_package_args_precipitate,
-        )
-
-        # Add inlet and outlet state blocks to control volume
         self.cv_aqueous.add_state_blocks(has_phase_equilibrium=False)
-        self.cv_precipitate.add_state_blocks(has_phase_equilibrium=False)
-        # add ports
         self.add_inlet_port(block=self.cv_aqueous, name="aqueous_inlet")
         self.add_outlet_port(block=self.cv_aqueous, name="aqueous_outlet")
-        self.add_inlet_port(block=self.cv_precipitate, name="precipitate_inlet")
-        self.add_outlet_port(block=self.cv_precipitate, name="precipitate_outlet")
 
-        prop_aqueous = self.config.property_package_aqueous
-        prop_precipitate = self.config.property_package_precipitate
+        if prop_sp is not None:
+            self.cv_precipitate = ControlVolume0DBlock(
+                dynamic=False,
+                has_holdup=False,
+                property_package=prop_sp,
+                property_package_args=self.config.property_package_args_precipitate,
+            )
+            self.cv_precipitate.add_state_blocks(has_phase_equilibrium=False)
+            self.add_inlet_port(block=self.cv_precipitate, name="precipitate_inlet")
+            self.add_outlet_port(block=self.cv_precipitate, name="precipitate_outlet")
 
-        # Params
-        # create a set containing all reaction logkeq values
-        self.merged_logkeq_dict = (
-            prop_aqueous.logkeq_dict | prop_precipitate.logkeq_dict
-        )
-        # create a set containing all reactions
-        self.merged_rxns = self.merged_logkeq_dict.keys()
+        if prop_gas is not None:
+            self.cv_gas = ControlVolume0DBlock(
+                dynamic=False,
+                has_holdup=False,
+                property_package=prop_gas,
+                property_package_args=self.config.property_package_args_gas,
+            )
+            self.cv_gas.add_state_blocks(has_phase_equilibrium=False)
+            self.add_inlet_port(block=self.cv_gas, name="gas_inlet")
+            self.add_outlet_port(block=self.cv_gas, name="gas_outlet")
 
-        # make a param of all the logkeq values (precipitation and aqueous equilibrium)
-        self.log_k = pyo.Param(
-            self.merged_logkeq_dict.keys(),
-            initialize=lambda m, key: self.merged_logkeq_dict[key],
-            within=pyo.Reals,
-        )
+        # ----------------------------------------------------------------- #
+        # Reaction data: ln(K) at 298.15 K and reaction enthalpies
+        # ----------------------------------------------------------------- #
+        ln_k_ref = dict(prop_aq.ln_k_dict)
+        dHr = dict(prop_aq.dHr_dict)
+        if prop_sp is not None:
+            ln_k_ref.update(prop_sp.ln_k_dict)
+            dHr.update(prop_sp.dHr_dict)
+        if prop_gas is not None:
+            ln_k_ref.update(prop_gas.ln_k_dict)
+            dHr.update(prop_gas.dHr_dict)
+        self.merged_rxns = pyo.Set(initialize=list(ln_k_ref.keys()))
 
-        # variables
-        self.rxn_extent = pyo.Var(
+        self.log_k_ref = pyo.Param(
             self.merged_rxns,
-            initialize=1,
-            doc="Extent of the reaction.",
-            units=pyunits.mol / pyunits.kg,
+            initialize=ln_k_ref,
+            within=pyo.Reals,
+            doc="ln(K) of each reaction at the reference temperature",
         )
-        # log(q) for precipitation reactions
-        self.log_q = pyo.Var(
-            prop_precipitate.rxn_set,
-            initialize=1,
-            doc="log(q) var for each reaction",
+        self.dHr = pyo.Param(
+            self.merged_rxns,
+            initialize=lambda b, r: dHr.get(r, 0.0),
+            within=pyo.Reals,
+            units=pyunits.J / pyunits.mol,
+            doc="Standard enthalpy of reaction; zero (isothermal) when not supplied",
+        )
+
+        # ----------------------------------------------------------------- #
+        # Temperature and the Van't Hoff correction
+        # ----------------------------------------------------------------- #
+        self.T_ref = pyo.Param(
+            initialize=T_REF,
+            units=pyunits.K,
+            doc="Reference temperature of the equilibrium constants",
+        )
+        self.temperature = pyo.Var(
+            initialize=self.config.temperature,
+            bounds=(273.15, 373.15),
+            units=pyunits.K,
+            doc="Process temperature",
+        )
+        self.inv_temp = pyo.Var(
+            initialize=1.0 / float(self.config.temperature),
+            bounds=(1.0 / 373.15, 1.0 / 273.15),
+            units=pyunits.K**-1,
+            doc="Reciprocal of the process temperature",
+        )
+
+        @self.Constraint(doc="Reciprocal temperature definition")
+        def inv_temp_definition(blk):
+            return blk.inv_temp * blk.temperature == 1.0
+
+        @self.Expression(
+            self.merged_rxns, doc="ln(K) at the process temperature (Van't Hoff)"
+        )
+        def log_k(blk, r):
+            return blk.log_k_ref[r] + (
+                blk.dHr[r] / (R_GAS * pyunits.J / pyunits.mol / pyunits.K)
+            ) * (1 / blk.T_ref - blk.inv_temp)
+
+        # ----------------------------------------------------------------- #
+        # Reference quantities that make the log arguments dimensionless
+        # ----------------------------------------------------------------- #
+        self.c_ref = pyo.Param(
+            initialize=1.0, units=pyunits.mol / pyunits.L, doc="Reference concentration"
+        )
+        self.t_batch = pyo.Param(
+            initialize=1.0,
+            units=pyunits.s,
+            doc="Time basis converting flow rates to amounts per batch",
+        )
+
+        # ----------------------------------------------------------------- #
+        # Variables
+        # ----------------------------------------------------------------- #
+        self.rxn_extent = pyo.Var(
+            time,
+            self.merged_rxns,
+            initialize=0.0,
+            bounds=(-1e3, 1e3),
+            units=pyunits.mol / pyunits.L,
+            doc="Extent of reaction per unit volume of solution",
+        )
+        self.log_conc_out = pyo.Var(
+            time,
+            prop_aq.component_list,
+            initialize=-5.0,
+            bounds=(-60.0, 10.0),
             units=pyunits.dimensionless,
+            doc="ln(C_out / c_ref) of each aqueous component",
         )
-        self.m_ref = pyo.Param(
-            initialize=1,
-            doc="Reference molality of 1 to make log(molalities) dimensionless",
-            units=pyunits.mol / pyunits.kg,
-        )
+        if prop_sp is not None:
+            self.log_q_sp = pyo.Var(
+                time,
+                prop_sp.rxn_set,
+                initialize=-5.0,
+                bounds=(-200.0, 50.0),
+                units=pyunits.dimensionless,
+                doc="ln(Q) of each precipitation reaction",
+            )
 
-        # constraints
+        # ----------------------------------------------------------------- #
+        # Log linking and equilibrium constraints
+        # ----------------------------------------------------------------- #
         @self.Constraint(
-            self.flowsheet().time,
-            prop_aqueous.rxn_set,
-            doc="equilibrium reactions (log form) constraints (non-precipitate forming)",
+            time,
+            prop_aq.component_list,
+            doc="Outlet molar flow from its log concentration",
         )
-        def log_k_equilibrium_rxn_eqns(blk, t, r):
+        def log_conc_linking_eqns(blk, t, j):
+            return blk.cv_aqueous.properties_out[t].flow_mol_comp[j] == (
+                pyo.exp(blk.log_conc_out[t, j])
+                * blk.c_ref
+                * blk.cv_aqueous.properties_out[t].flow_vol
+            )
 
+        @self.Constraint(time, prop_aq.rxn_set, doc="Aqueous equilibrium in log form")
+        def aqueous_equilibrium_eqns(blk, t, r):
             return blk.log_k[r] == sum(
-                prop_aqueous.stoich_dict[r][c]
-                * pyo.log10(
-                    blk.cv_aqueous.properties_out[t].molality_aqueous_comp[c]
-                    / self.m_ref
+                prop_aq.stoich_dict[r][j] * blk.log_conc_out[t, j]
+                for j in prop_aq.stoich_dict[r]
+            )
+
+        if prop_sp is not None:
+
+            @self.Constraint(
+                time, prop_sp.rxn_set, doc="ln(Q) of the precipitation reactions"
+            )
+            def log_q_precipitate_equilibrium_rxn_eqns(blk, t, r):
+                return blk.log_q_sp[t, r] == sum(
+                    prop_aq.stoich_dict[r][j] * blk.log_conc_out[t, j]
+                    for j in prop_aq.stoich_dict.get(r, {})
                 )
-                for c in prop_aqueous.stoich_dict[r]
-            )
 
-        @self.Constraint(
-            self.flowsheet().time,
-            prop_precipitate.rxn_set,
-            doc="equilibrium reactions (log form) constraints (precipitate forming)",
-        )
-        def log_q_precipitate_equilibrium_rxn_eqns(blk, t, r):
+            if self.config.formulation == "objective":
 
-            return blk.log_q[r] == sum(
-                prop_aqueous.stoich_dict[r][c]
-                * pyo.log10(
-                    blk.cv_aqueous.properties_out[t].molality_aqueous_comp[c]
-                    / self.m_ref
+                @self.Constraint(time, prop_sp.rxn_set, doc="ln(Q) at most ln(Ksp)")
+                def precip_sat_ineq(blk, t, r):
+                    return blk.log_q_sp[t, r] <= blk.log_k[r]
+
+                @self.Objective(
+                    doc="Minimize the distance to saturation of the precipitation reactions"
                 )
-                for c in prop_aqueous.stoich_dict[r]
+                def min_logs(blk):
+                    return sum(
+                        (blk.log_k[r] - blk.log_q_sp[t, r]) ** 2
+                        for t in time
+                        for r in prop_sp.rxn_set
+                    )
+
+            else:
+
+                def _precipitation_complementarity_rule(blk, t, r):
+                    solid = blk._solid_of_reaction(r)
+                    return complements(
+                        blk.cv_precipitate.properties_out[t].moles_precipitate_comp[
+                            solid
+                        ]
+                        >= 0.0 * pyunits.mol / pyunits.s,
+                        blk.log_k[r] - blk.log_q_sp[t, r] >= 0.0,
+                    )
+
+                self.precipitation_complementarity = Complementarity(
+                    time,
+                    prop_sp.rxn_set,
+                    rule=_precipitation_complementarity_rule,
+                    doc="Saturation rule: the solid is absent or the solution is saturated",
+                )
+
+        # ----------------------------------------------------------------- #
+        # Material balances
+        # ----------------------------------------------------------------- #
+        @self.Constraint(
+            time, prop_aq.component_list, doc="Aqueous component mole balance"
+        )
+        def aqueous_mole_balance_eqns(blk, t, j):
+            return blk.cv_aqueous.properties_out[t].flow_mol_comp[j] == (
+                blk.cv_aqueous.properties_in[t].flow_mol_comp[j]
+                + sum(
+                    prop_aq.stoich_dict.get(r, {}).get(j, 0) * blk.rxn_extent[t, r]
+                    for r in blk.merged_rxns
+                )
+                * blk.cv_aqueous.properties_out[t].flow_vol
             )
 
-        # log(q) must be <= log(k) for precipitating reactions
-        @self.Constraint(
-            prop_precipitate.rxn_set,
-            doc="log(q) must be less than or equal to log(k) for precipitating reactions.",
-        )
-        def precip_rxns_log_cons(blk, r):
-            return blk.log_q[r] <= self.log_k[r]
-
-        # mole balance on all aqueous components
-        @self.Constraint(
-            self.flowsheet().time,
-            prop_aqueous.component_list,
-            doc="Aqueous Components Mole balance equations.",
-        )
-        def aqueous_mole_balance_eqns(blk, t, comp):
-            return blk.cv_aqueous.properties_out[t].molality_aqueous_comp[
-                comp
-            ] == blk.cv_aqueous.properties_in[t].molality_aqueous_comp[comp] + sum(
-                prop_aqueous.stoich_dict[r][comp] * blk.rxn_extent[r]
-                for r in self.merged_rxns
-            )
-
-        # balance on volume coming in and out
-        @self.Constraint(self.flowsheet().time, doc="volume balance equation.")
+        @self.Constraint(time, doc="Volume balance")
         def vol_balance(blk, t):
             return (
                 blk.cv_aqueous.properties_out[t].flow_vol
                 == blk.cv_aqueous.properties_in[t].flow_vol
             )
 
-        # mole balance on all precipitate components
-        @self.Constraint(
-            self.flowsheet().time,
-            prop_precipitate.component_list,
-            doc="Precipitate Components Mole balance equations.",
-        )
-        def precipitate_mole_balance_eqns(blk, t, comp):
-            return blk.cv_precipitate.properties_out[t].moles_precipitate_comp[
-                comp
-            ] == blk.cv_precipitate.properties_in[t].moles_precipitate_comp[comp] + sum(
-                prop_precipitate.stoich_dict[r][comp]
-                * blk.rxn_extent[r]
-                * blk.cv_aqueous.properties_out[t].flow_vol
-                for r in prop_precipitate.rxn_set
+        @self.Expression(time, doc="Volume of solution treated per batch")
+        def volume(blk, t):
+            return pyunits.convert(
+                blk.cv_aqueous.properties_in[t].flow_vol * blk.t_batch,
+                to_units=pyunits.L,
             )
 
-        # objective function to minimize difference between log(k) and log(q)
-        @self.Objective(
-            doc="objective function minimize difference between log(k) and log(q)"
+        if prop_sp is not None:
+
+            @self.Constraint(
+                time, prop_sp.component_list, doc="Precipitate component mole balance"
+            )
+            def precipitate_mole_balance_eqns(blk, t, j):
+                return blk.cv_precipitate.properties_out[t].moles_precipitate_comp[
+                    j
+                ] == blk.cv_precipitate.properties_in[t].moles_precipitate_comp[
+                    j
+                ] + sum(
+                    prop_sp.stoich_dict.get(r, {}).get(j, 0)
+                    * blk.rxn_extent[t, r]
+                    * blk.cv_aqueous.properties_out[t].flow_vol
+                    for r in prop_sp.rxn_set
+                )
+
+        # ----------------------------------------------------------------- #
+        # Gas phase
+        # ----------------------------------------------------------------- #
+        if prop_gas is not None:
+            self._build_gas_phase()
+
+    def _solid_of_reaction(self, r):
+        """Precipitate consumed by dissolution reaction r (negative coefficient)."""
+        prop_sp = self.config.property_package_precipitate
+        for j, alpha in prop_sp.stoich_dict.get(r, {}).items():
+            if alpha < 0:
+                return j
+        raise ValueError(
+            f"{self.name}: precipitation reaction {r} has no precipitate with a "
+            "negative stoichiometric coefficient."
         )
-        def min_logs(blk, r):
-            return sum(
-                (self.log_k[r] - blk.log_q[r]) ** 2 for r in prop_precipitate.rxn_set
+
+    def _build_gas_phase(self):
+        """Gas-phase variables, gas-liquid equilibrium, ideal gas law and balances."""
+        prop_aq = self.config.property_package_aqueous
+        prop_gas = self.config.property_package_gas
+        time = self.flowsheet().time
+
+        self.p_ref = pyo.Param(
+            initialize=1.0, units=pyunits.bar, doc="Reference pressure"
+        )
+        self.n_ref = pyo.Param(
+            initialize=1.0, units=pyunits.mol / pyunits.s, doc="Reference molar flow"
+        )
+        if self.config.gas_volume is not None:
+            self.gas_volume = pyo.Param(
+                initialize=float(self.config.gas_volume),
+                mutable=True,
+                units=pyunits.L,
+                doc="Gas-phase volume",
+            )
+
+        self.partial_pressure = pyo.Var(
+            time,
+            prop_gas.component_list,
+            initialize=1.0,
+            bounds=(1e-15, 100.0),
+            units=pyunits.bar,
+            doc="Partial pressure of each gas component",
+        )
+        self.log_partial_pressure = pyo.Var(
+            time,
+            prop_gas.component_list,
+            initialize=0.0,
+            bounds=(-60.0, 5.0),
+            units=pyunits.dimensionless,
+            doc="ln(P / p_ref) of each gas component",
+        )
+        self.log_moles_gas_out = pyo.Var(
+            time,
+            prop_gas.component_list,
+            initialize=-5.0,
+            bounds=(-60.0, 10.0),
+            units=pyunits.dimensionless,
+            doc="ln(n_out / n_ref) of each gas component",
+        )
+
+        @self.Expression(time, doc="Gas-phase volume used by the ideal gas law")
+        def gas_volume_basis(blk, t):
+            if hasattr(blk, "gas_volume"):
+                return blk.gas_volume
+            return blk.volume[t]
+
+        @self.Expression(
+            time, prop_gas.component_list, doc="Partial pressure from the ideal gas law"
+        )
+        def partial_pressure_from_moles(blk, t, j):
+            return pyunits.convert(
+                blk.cv_gas.properties_out[t].moles_gas_comp[j]
+                * blk.t_batch
+                * (R_GAS_L_BAR * pyunits.L * pyunits.bar / pyunits.mol / pyunits.K)
+                * blk.temperature
+                / blk.gas_volume_basis[t],
+                to_units=pyunits.bar,
+            )
+
+        @self.Constraint(
+            time, prop_gas.component_list, doc="Partial pressure from its log"
+        )
+        def log_pressure_linking_eqns(blk, t, j):
+            return (
+                blk.partial_pressure[t, j]
+                == pyo.exp(blk.log_partial_pressure[t, j]) * blk.p_ref
+            )
+
+        @self.Constraint(
+            time, prop_gas.component_list, doc="Outlet gas molar flow from its log"
+        )
+        def log_moles_gas_linking_eqns(blk, t, j):
+            return (
+                blk.cv_gas.properties_out[t].moles_gas_comp[j]
+                == pyo.exp(blk.log_moles_gas_out[t, j]) * blk.n_ref
+            )
+
+        ln_rho_over_mw = math.log(prop_gas.rho_solvent / prop_gas.MW_solvent)
+
+        @self.Constraint(
+            time, prop_gas.rxn_set, doc="Gas-liquid equilibrium in log form"
+        )
+        def gas_equilibrium_eqns(blk, t, r):
+            stoich_r = prop_gas.stoich_dict[r]
+            gas_term = sum(
+                stoich_r[j] * (blk.log_partial_pressure[t, j] + ln_rho_over_mw)
+                for j in stoich_r
+                if j in prop_gas.component_list
+            )
+            aq_term = sum(
+                stoich_r[j] * blk.log_conc_out[t, j]
+                for j in stoich_r
+                if j in prop_aq.component_list
+            )
+            return blk.log_k[r] == gas_term + aq_term
+
+        @self.Constraint(time, prop_gas.component_list, doc="Ideal gas law in log form")
+        def ideal_gas_eqns(blk, t, j):
+            # P = n t R T / V  ->  ln(P/p_ref) - ln(n/n_ref) = ln(n_ref t R T / (V p_ref))
+            factor = (
+                pyunits.convert(
+                    blk.n_ref
+                    * blk.t_batch
+                    * (R_GAS_L_BAR * pyunits.L * pyunits.bar / pyunits.mol / pyunits.K)
+                    * blk.temperature
+                    / blk.gas_volume_basis[t],
+                    to_units=pyunits.bar,
+                )
+                / blk.p_ref
+            )
+            return blk.log_partial_pressure[t, j] - blk.log_moles_gas_out[
+                t, j
+            ] == pyo.log(factor)
+
+        @self.Constraint(
+            time, prop_gas.component_list, doc="Gas component mole balance"
+        )
+        def gas_mole_balance_eqns(blk, t, j):
+            return blk.cv_gas.properties_out[t].moles_gas_comp[j] == (
+                blk.cv_gas.properties_in[t].moles_gas_comp[j]
+                + sum(
+                    prop_gas.stoich_dict.get(r, {}).get(j, 0) * blk.rxn_extent[t, r]
+                    for r in prop_gas.rxn_set
+                )
+                * blk.cv_aqueous.properties_out[t].flow_vol
             )
 
     def _get_stream_table_contents(self, time_point=0):
-        return create_stream_table_dataframe(
-            {
-                "Aqueous Inlet": self.aqueous_inlet,
-                "Aqueous Outlet": self.aqueous_outlet,
-                "Precipitate Inlet": self.precipitate_inlet,
-                "Precipitate Outlet": self.precipitate_outlet,
-            },
-            time_point=time_point,
-        )
+        streams = {
+            "Aqueous Inlet": self.aqueous_inlet,
+            "Aqueous Outlet": self.aqueous_outlet,
+        }
+        if self.config.property_package_precipitate is not None:
+            streams["Precipitate Inlet"] = self.precipitate_inlet
+            streams["Precipitate Outlet"] = self.precipitate_outlet
+        if self.config.property_package_gas is not None:
+            streams["Gas Inlet"] = self.gas_inlet
+            streams["Gas Outlet"] = self.gas_outlet
+        return create_stream_table_dataframe(streams, time_point=time_point)
 
     def _get_performance_contents(self, time_point=0):
-        var_dict = {}
-
-        for r in self.merged_rxns:
-            name = f"Reaction {r} extent"
-            rxn_extent = self.rxn_extent[r]
-
-            var_dict[name] = rxn_extent
-
-        return {"vars": var_dict}
+        var_dict = {"Temperature": self.temperature}
+        expr_dict = {
+            f"Reaction {r} extent": self.rxn_extent[time_point, r]
+            for r in self.merged_rxns
+        }
+        return {"vars": var_dict, "exprs": expr_dict}

@@ -4,7 +4,9 @@
 # University of California, through Lawrence Berkeley National Laboratory, et al. All rights reserved.
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
-from pyomo.environ import ConcreteModel, Var
+import math
+
+from pyomo.environ import ConcreteModel, Var, value
 
 from idaes.core import FlowsheetBlock
 
@@ -38,19 +40,28 @@ def test_build():
         aqueous_comp_list=aqueous_comp_list,
         logkeq_dict=aqueous_log_keq_dict,
         stoich_dict=aqueous_stoich_dict,
+        dHr_dict={"E2": 55_800.0},
     )
+
+    assert set(m.fs.aqueous_properties.rxn_set) == {"E1", "E2"}
+    assert m.fs.aqueous_properties.ln_k_dict["E1"] == pytest.approx(
+        1.084 * math.log(10)
+    )
+    assert m.fs.aqueous_properties.dHr_dict == {"E2": 55_800.0}
 
     m.fs.state = m.fs.aqueous_properties.build_state_block(m.fs.time)
     assert len(m.fs.state) == 1
 
-    assert isinstance(m.fs.state[0].molality_aqueous_comp, Var)
+    assert isinstance(m.fs.state[0].flow_mol_comp, Var)
     assert isinstance(m.fs.state[0].flow_vol, Var)
 
-    m.fs.state[0].flow_vol.set_value(1)
+    m.fs.state[0].flow_vol.set_value(2)
     for i in m.fs.aqueous_properties.component_list:
-        m.fs.state[0].molality_aqueous_comp[i].set_value(0.5)
+        m.fs.state[0].flow_mol_comp[i].set_value(0.5)
+    assert value(m.fs.state[0].conc_mol_comp["H^+"]) == pytest.approx(0.25)
 
     m.fs.state.fix_initialization_states()
 
+    assert m.fs.state[0].flow_vol.fixed
     for i in m.fs.aqueous_properties.component_list:
-        assert m.fs.state[0].molality_aqueous_comp[i].fixed
+        assert m.fs.state[0].flow_mol_comp[i].fixed

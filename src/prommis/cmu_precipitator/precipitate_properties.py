@@ -5,10 +5,12 @@
 # Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license information.
 #####################################################################################################
 """
-Precipitate property package for optimization-based precipitator model.
+Precipitate property package for the optimization-based precipitator model.
 
 Authors: Chris Laliwala
 """
+
+import math
 
 from pyomo.common.config import ConfigValue
 from pyomo.environ import Set, Var
@@ -24,15 +26,20 @@ from idaes.core import (
 )
 from idaes.core.util.initialization import fix_state_vars
 
+LN10 = math.log(10.0)
+
 
 @declare_process_block_class("PrecipitateParameter")
 class PrecipitateParameterData(PhysicalParameterBlock):
     """
     Property package for precipitate species.
 
-    This property package requires that the user pass in a list of precipitate components (precipitate_comp_list),
-    a dictionary of the precipitate-forming equilibrium reaction constants (logkeq_dict), and a dictionary containing
-    the precipitate stoichiometry for each reaction (stoich_dict).
+    The user passes a list of precipitate components (precipitate_comp_list), a dictionary
+    of the solubility products of the precipitation/dissolution reactions in log10 form
+    (logkeq_dict), a dictionary of the precipitate stoichiometry of every reaction
+    (stoich_dict; the dissolving solid carries a negative coefficient), and optionally a
+    dictionary of standard reaction enthalpies (dHr_dict, J/mol) used for the Van't Hoff
+    temperature correction of the solubility products.
     """
 
     CONFIG = PhysicalParameterBlock.CONFIG()
@@ -46,14 +53,23 @@ class PrecipitateParameterData(PhysicalParameterBlock):
         "logkeq_dict",
         ConfigValue(
             domain=dict,
-            description="Dictionary of precipitation-forming equilibrium reaction constants",
+            description="Dictionary of solubility products, log10(Ksp) at 298.15 K",
         ),
     )
     CONFIG.declare(
         "stoich_dict",
         ConfigValue(
             domain=dict,
-            description="Dictionary of precipitate stoichiometry for each reaction.",
+            description="Dictionary {reaction: {precipitate: stoichiometric coefficient}}",
+        ),
+    )
+    CONFIG.declare(
+        "dHr_dict",
+        ConfigValue(
+            default={},
+            domain=dict,
+            description="Dictionary {reaction: standard enthalpy of dissolution (J/mol)}; "
+            "reactions absent from the dictionary are treated as isothermal",
         ),
     )
 
@@ -66,17 +82,14 @@ class PrecipitateParameterData(PhysicalParameterBlock):
         self.SolidPhase = Phase()
         self.component_list = self.config.precipitate_comp_list
 
-        ## precipitation equilibrium reaction parameters
         # precipitation equilibrium reaction index
-        self.rxn_set = Set(
-            initialize=list(set(key for key in self.config.logkeq_dict.keys()))
-        )
+        self.rxn_set = Set(initialize=list(self.config.logkeq_dict.keys()))
 
-        # stoichiometry for each precipitation equilibrium reaction
+        # stoichiometry, log10(Ksp), ln(Ksp) and enthalpy of each reaction
         self.stoich_dict = self.config.stoich_dict
-
-        # log(keq) for each equilibrium precipitation reaction
         self.logkeq_dict = self.config.logkeq_dict
+        self.ln_k_dict = {r: v * LN10 for r, v in self.config.logkeq_dict.items()}
+        self.dHr_dict = self.config.dHr_dict
 
         self._state_block_class = PrecipitateStateBlock
 
@@ -127,6 +140,7 @@ class PrecipitateStateBlockData(StateBlockData):
             units=pyunits.mol / pyunits.s,
             initialize=1e-20,
             bounds=(1e-20, None),
+            doc="Molar flow rate of each precipitate component",
         )
 
     def get_material_flow_basis(self):
